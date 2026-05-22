@@ -5,10 +5,16 @@
 // framework. The TSP is a classic NP-hard combinatorial optimization
 // problem: find the shortest possible route that visits every city
 // exactly once and returns to the origin.
+//
+// v0.5 additions:
+// - Candidate edge sets for O(K) neighborhood searches
+// - Updated TspSolution with Arc<CandidateSet>
 
+pub mod candidates;
 pub mod heuristics;
 
 use crate::core::Solution;
+use candidates::CandidateSet;
 use std::sync::Arc;
 
 /// A city represented by 2D Euclidean coordinates.
@@ -25,24 +31,23 @@ impl City {
     }
 }
 
-/// A TSP solution: an ordered route of city indices with a shared distance matrix.
+/// A TSP solution: an ordered route of city indices with shared data.
 ///
 /// The route is a permutation of city indices representing the visitation order.
-/// The distance matrix is shared immutably via `Arc` to avoid redundant
-/// memory allocation across multiple threads.
+/// Both the distance matrix and candidate set are shared immutably via `Arc`
+/// to avoid redundant memory allocation across multiple threads.
 #[derive(Clone, Debug)]
 pub struct TspSolution {
     /// Order of city indices visited in the tour
     pub route: Vec<usize>,
-    /// Shared read-only distance matrix (Arc for zero-copy thread sharing)
+    /// Shared read-only distance matrix
     pub matrix: Arc<Vec<Vec<f64>>>,
+    /// Shared read-only candidate edge set (K nearest neighbors per city)
+    pub candidates: Arc<CandidateSet>,
 }
 
 impl Solution for TspSolution {
     /// Evaluates the total tour distance by summing all edge weights.
-    ///
-    /// This is the O(n) full re-evaluation path. The tour is treated as
-    /// a cycle: the last city connects back to the first.
     fn evaluate_global(&self) -> f64 {
         if self.route.is_empty() {
             return 0.0;
@@ -54,5 +59,21 @@ impl Solution for TspSolution {
             total_distance += self.matrix[from][to];
         }
         total_distance
+    }
+}
+
+impl TspSolution {
+    /// Creates a new TspSolution with all shared data.
+    pub fn new(route: Vec<usize>, matrix: Arc<Vec<Vec<f64>>>, candidates: Arc<CandidateSet>) -> Self {
+        Self { route, matrix, candidates }
+    }
+
+    /// Creates a TspSolution with an empty candidate set.
+    pub fn without_candidates(route: Vec<usize>, matrix: Arc<Vec<Vec<f64>>>) -> Self {
+        Self {
+            route,
+            matrix,
+            candidates: Arc::new(CandidateSet::empty()),
+        }
     }
 }
