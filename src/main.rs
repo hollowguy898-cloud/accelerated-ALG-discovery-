@@ -5,15 +5,22 @@
 // highly parallelizable (each search chain is independent), we spin up
 // multiple worker threads, each running its own MCMC optimization chain,
 // and reduce them to the ultimate global optimum.
+//
+// Improvements over v0.1:
+// - 4 low-level heuristics instead of 2 (added Or-opt and Ruin-Recreate)
+// - Reheat mechanism to escape stagnation
+// - Greedy nearest-neighbor initialization (instead of purely random)
 
 mod core;
 mod domain;
 mod infra;
 
-use core::engine::McmcEngine;
+use core::engine::{McmcEngine, ReheatConfig};
 use core::LowLevelHeuristic;
 use core::Solution;
-use domain::heuristics::{InvertSegmentHeuristic, SwapCitiesHeuristic};
+use domain::heuristics::{
+    InvertSegmentHeuristic, OrOptHeuristic, RuinRecreateHeuristic, SwapCitiesHeuristic,
+};
 use domain::{City, TspSolution};
 use rand::Rng;
 use std::sync::Arc;
@@ -21,7 +28,7 @@ use std::thread;
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  MCMC-Driven Hyper-Heuristic Optimization Framework        ║");
+    println!("║  MCMC-Driven Hyper-Heuristic Optimization Framework  v0.2  ║");
     println!("║  Mathematical Near-Perfection via Metropolis-Hastings      ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
@@ -67,10 +74,16 @@ fn main() {
     // The heuristics are registered as trait objects, enabling
     // zero-cost dynamic dispatch. New heuristics can be dropped in
     // without altering the core engine loop.
+    //
+    // We now use 4 heuristics for a balanced mix of:
+    // - Intensification (Swap, Or-opt)
+    // - Diversification (Invert, Ruin-Recreate)
     // ──────────────────────────────────────────────────────────────
     let heuristics: Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> = vec![
-        Arc::new(SwapCitiesHeuristic),   // Intensification: small local swaps
-        Arc::new(InvertSegmentHeuristic), // Diversification: large segment inversions
+        Arc::new(SwapCitiesHeuristic),       // Intensification: small local swaps
+        Arc::new(InvertSegmentHeuristic),    // Diversification: large segment inversions
+        Arc::new(OrOptHeuristic { max_segment_len: 3 }), // Intensification: relocate small segments
+        Arc::new(RuinRecreateHeuristic { ruin_fraction: 0.15 }), // Diversification: destroy & rebuild
     ];
     let shared_heuristics = Arc::new(heuristics);
 
@@ -81,12 +94,18 @@ fn main() {
     // randomized initial solution and cooling schedule. This provides
     // statistical diversity — different threads explore different
     // regions of the solution space.
+    //
+    // We use greedy nearest-neighbor initialization instead of purely
+    // random starts, giving each chain a much better starting point.
     // ──────────────────────────────────────────────────────────────
     let num_threads = 4;
-    let max_iterations = 40_000;
+    let max_iterations = 80_000;
     let mut worker_handles = vec![];
 
-    println!("Launching {} parallel search chains ({} iterations each)...", num_threads, max_iterations);
+    println!(
+        "Launching {} parallel search chains ({} iterations each)...",
+        num_threads, max_iterations
+    );
     println!();
 
     for thread_id in 0..num_threads {
@@ -94,12 +113,42 @@ fn main() {
         let heuristics_clone = Arc::clone(&shared_heuristics);
 
         worker_handles.push(thread::spawn(move || {
-            // Generate a randomized initial solution (Fisher-Yates shuffle)
-            let mut route: Vec<usize> = (0..num_cities).collect();
+            // Initialize with greedy nearest-neighbor, then randomize slightly
+            let n = matrix_clone.len();
+            let mut route: Vec<usize> = (0..n).collect();
+
+            // Greedy nearest-neighbor construction
+            let mut visited = vec![false; n];
             let mut rng = rand::thread_rng();
-            for i in (1..route.len()).rev() {
-                let j = rng.gen_range(0..=i);
-                route.swap(i, j);
+            let start_city = rng.gen_range(0..n);
+            route.clear();
+            route.push(start_city);
+            visited[start_city] = true;
+
+            for _ in 1..n {
+                let current = *route.last().unwrap();
+                let mut nearest = 0;
+                let mut nearest_dist = f64::MAX;
+                // Add some randomness: sample a subset instead of scanning all
+                let sample_size = (n / 4).max(10).min(n);
+                for _ in 0..sample_size {
+                    let j = rng.gen_range(0..n);
+                    if !visited[j] && matrix_clone[current][j] < nearest_dist {
+                        nearest_dist = matrix_clone[current][j];
+                        nearest = j;
+                    }
+                }
+                // Also check all unvisited if none found in sample
+                if nearest_dist == f64::MAX {
+                    for j in 0..n {
+                        if !visited[j] && matrix_clone[current][j] < nearest_dist {
+                            nearest_dist = matrix_clone[current][j];
+                            nearest = j;
+                        }
+                    }
+                }
+                visited[nearest] = true;
+                route.push(nearest);
             }
 
             let initial_sol = TspSolution {
@@ -109,16 +158,23 @@ fn main() {
 
             let initial_energy = initial_sol.evaluate_global();
             println!(
-                "  [Thread {}] Initial energy: {:.2}",
+                "  [Thread {}] Initial energy (greedy-NN): {:.2}",
                 thread_id, initial_energy
             );
 
-            // Build unique decoupled MCMC optimizer instance
-            let engine = McmcEngine::new(
+            // Build MCMC optimizer with reheat for escaping stagnation
+            let reheat = ReheatConfig {
+                stagnation_limit: 5000, // Reheat after 5000 iterations without improvement
+                reheat_fraction: 0.4,   // Reheat to 40% of initial temperature
+                max_reheats: 3,         // Allow up to 3 reheats
+            };
+
+            let engine = McmcEngine::with_reheat(
                 heuristics_clone.to_vec(),
                 150.0,   // Initial temperature: high for broad exploration
-                0.9995,  // Slow decay: search comprehensively before cooling
+                0.9997,  // Slower decay for more thorough search
                 1e-4,    // Minimum temperature: halt when frozen
+                reheat,
             );
 
             let (best_sol, telemetry) = engine.optimize(initial_sol, max_iterations);
@@ -126,11 +182,12 @@ fn main() {
             let final_energy = best_sol.evaluate_global();
             let improvement = initial_energy - final_energy;
             println!(
-                "  [Thread {} Complete] Final: {:.2} | Improvement: {:.2} ({:.1}%)",
+                "  [Thread {} Complete] Final: {:.2} | Improvement: {:.2} ({:.1}%) | Reheats: {}",
                 thread_id,
                 final_energy,
                 improvement,
-                (improvement / initial_energy) * 100.0
+                (improvement / initial_energy) * 100.0,
+                telemetry.reheat_count,
             );
 
             (best_sol, telemetry, thread_id)
@@ -158,7 +215,6 @@ fn main() {
                 absolute_best_sol = Some(sol);
             }
 
-            // Output analytical breakdown of low-level mutation acceptance
             println!(
                 "  Thread {} | Heuristic Acceptance: {:?}",
                 thread_id, telemetry.acceptance_counts
@@ -171,8 +227,6 @@ fn main() {
 
     if let Some(final_run) = absolute_best_sol {
         // Compute the theoretical optimum for circular city layout
-        // Each arc between adjacent cities on the unit circle of radius 100:
-        //   d = 2 * 100 * sin(π/60) ≈ 10.46
         let arc_distance = 2.0 * 100.0 * (std::f64::consts::PI / num_cities as f64).sin();
         let theoretical_optimum = arc_distance * num_cities as f64;
 

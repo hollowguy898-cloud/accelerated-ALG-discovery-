@@ -11,20 +11,24 @@
 // - **Heuristic acceptance tracking**: Records which heuristics are being
 //   accepted most often, enabling analysis of which mutation strategies
 //   are most effective at each phase of the search.
+// - **Reheat tracking**: Records how many times the reheat mechanism fired.
 
 use std::collections::HashMap;
 
 /// Telemetry data collected during an optimization run.
 ///
-/// This structure captures two key metrics:
+/// This structure captures key metrics:
 /// 1. **Energy history**: A downsampled time series of (iteration, current_energy, best_energy)
 /// 2. **Acceptance counts**: How many times each low-level heuristic's proposed
-///    solution was accepted by the MCMC criterion
+///   solution was accepted by the MCMC criterion
+/// 3. **Reheat count**: How many times the reheat mechanism was triggered
 pub struct Telemetry {
     /// Downsampled history of energy values: (iteration, current_energy, best_energy)
     pub energy_history: Vec<(usize, f64, f64)>,
     /// Count of accepted moves per heuristic name
     pub acceptance_counts: HashMap<String, usize>,
+    /// Number of times the reheat mechanism was triggered
+    pub reheat_count: usize,
 }
 
 impl Telemetry {
@@ -39,6 +43,7 @@ impl Telemetry {
         Self {
             energy_history: history,
             acceptance_counts: HashMap::new(),
+            reheat_count: 0,
         }
     }
 
@@ -51,6 +56,11 @@ impl Telemetry {
             .acceptance_counts
             .entry(name.to_string())
             .or_insert(0) += 1;
+    }
+
+    /// Records that the reheat mechanism was triggered.
+    pub fn record_reheat(&mut self) {
+        self.reheat_count += 1;
     }
 
     /// Updates the energy history (downsampled to every 500 iterations).
