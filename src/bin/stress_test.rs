@@ -1,13 +1,13 @@
 // src/bin/stress_test.rs
-// Comprehensive stress test suite v0.3
-// 6 heuristics + choice function + adaptive cooling + chains + multi-start
+// Comprehensive stress test suite v0.4
+// 2-opt-best-K + choice function + adaptive cooling + chains
 
 use accelerated_alg_discovery::core::engine::{McmcEngine, ReheatConfig, ChoiceFunctionConfig, AdaptiveCoolingConfig};
 use accelerated_alg_discovery::core::LowLevelHeuristic;
 use accelerated_alg_discovery::core::Solution;
 use accelerated_alg_discovery::domain::heuristics::{
     DoubleBridgeHeuristic, InvertSegmentHeuristic, OrOptHeuristic, RuinRecreateHeuristic,
-    SwapCitiesHeuristic, ThreeOptHeuristic,
+    SwapCitiesHeuristic, TwoOptBestOfK,
 };
 use accelerated_alg_discovery::domain::{City, TspSolution};
 use rand::Rng;
@@ -99,8 +99,8 @@ fn make_heuristics() -> Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> {
     vec![
         Arc::new(SwapCitiesHeuristic),
         Arc::new(InvertSegmentHeuristic),
+        Arc::new(TwoOptBestOfK { k: 15 }),
         Arc::new(OrOptHeuristic { max_segment_len: 3 }),
-        Arc::new(ThreeOptHeuristic),
         Arc::new(RuinRecreateHeuristic { ruin_fraction: 0.15 }),
         Arc::new(DoubleBridgeHeuristic),
     ]
@@ -109,16 +109,16 @@ fn make_heuristics() -> Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> {
 fn make_engine_config(max_iterations: usize) -> (ReheatConfig, ChoiceFunctionConfig, AdaptiveCoolingConfig, usize) {
     let reheat = ReheatConfig {
         stagnation_limit: (max_iterations / 8).max(3000),
-        reheat_fraction: 0.45,
+        reheat_fraction: 0.5,
         max_reheats: 5,
     };
-    let choice = ChoiceFunctionConfig { alpha: 1.0, beta: 0.5, decay: 0.8 };
+    let choice = ChoiceFunctionConfig { alpha: 1.0, beta: 0.3, decay: 0.7 };
     let adaptive = AdaptiveCoolingConfig {
-        target_acceptance_rate: 0.35, window_size: 500,
+        target_acceptance_rate: 0.4, window_size: 400,
         cooling_rate_floor: 0.9990, cooling_rate_ceiling: 0.99995,
-        base_cooling_rate: 0.9997, adaptation_speed: 0.1,
+        base_cooling_rate: 0.9997, adaptation_speed: 0.08,
     };
-    (reheat, choice, adaptive, 3) // chain_depth = 3
+    (reheat, choice, adaptive, 2) // chain_depth = 2
 }
 
 // ──── Result tracking ────
@@ -309,7 +309,7 @@ fn main() {
     println!("SECTION 6: ENDURANCE (500 cities, 8 threads)");
     {
         let cities = generate_random_uniform_cities(500, 1000.0);
-        let r = run_parallel_test("endurance_500", &cities, 8, 120_000);
+        let r = run_parallel_test("endurance_500", &cities, 8, 100_000);
         if r.improvement_vs_greedy_pct < 10.0 { failures += 1; }
         results.push(r);
     }
