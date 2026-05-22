@@ -7,8 +7,8 @@
 // full re-evaluations of the entire tour.
 //
 // Design principle: the heuristic library contains a balanced mix of
-// - **Intensification** tools (small local tweaks: swap, or-opt)
-// - **Diversification** tools (large disruptions: invert, ruin-recreate)
+// - **Intensification** tools (small local tweaks: swap, or-opt, 3-opt)
+// - **Diversification** tools (large disruptions: invert, ruin-recreate, double-bridge)
 //
 // This balance ensures the MCMC sampler can navigate the problem space
 // efficiently and maintain ergodicity across problem scales.
@@ -17,6 +17,7 @@ use crate::core::LowLevelHeuristic;
 use crate::core::Solution;
 use crate::domain::TspSolution;
 use rand::Rng;
+use std::sync::Arc;
 
 /// **Swap Cities Heuristic** (Intensification)
 ///
@@ -275,6 +276,128 @@ impl LowLevelHeuristic<TspSolution> for RuinRecreateHeuristic {
         }
 
         let new_energy = solution.evaluate_global();
+        Some(new_energy - old_energy)
+    }
+}
+
+/// **3-Opt Heuristic** (Intensification)
+///
+/// Removes 3 edges from the tour and tries 2 of the most effective
+/// reconnection patterns, picking the cheaper one.
+///
+/// Uses full re-evaluation for correctness. The two patterns tried are:
+/// - Pattern A: Swap the two middle segments
+/// - Pattern B: Invert the combined middle region (2-opt style)
+pub struct ThreeOptHeuristic;
+
+impl LowLevelHeuristic<TspSolution> for ThreeOptHeuristic {
+    fn name(&self) -> &'static str {
+        "three_opt"
+    }
+
+    fn apply(&self, solution: &mut TspSolution) -> Option<f64> {
+        let n = solution.route.len();
+        if n < 8 {
+            return None;
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut i = rng.gen_range(1..n);
+        let mut j = rng.gen_range(1..n);
+        let mut k = rng.gen_range(1..n);
+        let mut pts = [i, j, k];
+        pts.sort();
+        i = pts[0]; j = pts[1]; k = pts[2];
+
+        if j - i < 2 || k - j < 2 || n - k + i < 2 {
+            return Some(0.0);
+        }
+
+        let old_energy = solution.evaluate_global();
+
+        // Pattern A: [0..i] + [j..k] + [i..j] + [k..]
+        let mut route_a = solution.route[0..i].to_vec();
+        route_a.extend_from_slice(&solution.route[j..k]);
+        route_a.extend_from_slice(&solution.route[i..j]);
+        route_a.extend_from_slice(&solution.route[k..]);
+
+        // Pattern B: invert [i..k]
+        let mut route_b = solution.route.clone();
+        route_b[i..k].reverse();
+
+        let sol_a = TspSolution { route: route_a, matrix: Arc::clone(&solution.matrix) };
+        let sol_b = TspSolution { route: route_b, matrix: Arc::clone(&solution.matrix) };
+
+        let e_a = sol_a.evaluate_global();
+        let e_b = sol_b.evaluate_global();
+
+        if e_a <= e_b && e_a < old_energy {
+            solution.route = sol_a.route;
+            Some(e_a - old_energy)
+        } else if e_b < old_energy {
+            solution.route = sol_b.route;
+            Some(e_b - old_energy)
+        } else if e_a <= e_b {
+            solution.route = sol_a.route;
+            Some(e_a - old_energy)
+        } else {
+            solution.route = sol_b.route;
+            Some(e_b - old_energy)
+        }
+    }
+}
+
+/// **Double-Bridge Kick Heuristic** (Diversification)
+///
+/// A specialized 4-opt move that cuts the tour at 4 points and
+/// reassembles it in a different order. This is the classic "kick"
+/// move used in Lin-Kernighan-Helsgaun and Iterated Local Search.
+///
+/// Unlike random perturbations, the double-bridge preserves much of
+/// the tour structure while still making a large enough change to
+/// escape any local optimum. It's the gold standard diversification
+/// move for TSP.
+///
+/// Uses full re-evaluation.
+pub struct DoubleBridgeHeuristic;
+
+impl LowLevelHeuristic<TspSolution> for DoubleBridgeHeuristic {
+    fn name(&self) -> &'static str {
+        "double_bridge"
+    }
+
+    fn apply(&self, solution: &mut TspSolution) -> Option<f64> {
+        let n = solution.route.len();
+        if n < 12 {
+            return None;
+        }
+
+        let mut rng = rand::thread_rng();
+
+        // Pick 4 breakpoints dividing the tour into 5 segments
+        let quarter = n / 4;
+        let mut pts = vec![
+            rng.gen_range(1..quarter.max(2)),
+            rng.gen_range(quarter..2 * quarter),
+            rng.gen_range(2 * quarter..3 * quarter),
+            rng.gen_range(3 * quarter..n),
+        ];
+        pts.sort();
+        let (p1, p2, p3, p4) = (pts[0], pts[1], pts[2], pts[3]);
+
+        let seg_a = solution.route[0..p1].to_vec();
+        let seg_b = solution.route[p1..p2].to_vec();
+        let seg_c = solution.route[p2..p3].to_vec();
+        let seg_d = solution.route[p3..p4].to_vec();
+        let seg_e = solution.route[p4..].to_vec();
+
+        // Double-bridge reconnection: A + D + C + B + E
+        let new_route: Vec<usize> = [seg_a, seg_d, seg_c, seg_b, seg_e].concat();
+
+        let old_energy = solution.evaluate_global();
+        solution.route = new_route;
+        let new_energy = solution.evaluate_global();
+
         Some(new_energy - old_energy)
     }
 }
