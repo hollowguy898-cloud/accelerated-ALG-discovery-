@@ -537,8 +537,9 @@ impl LowLevelHeuristic<TspSolution> for RuinRecreateHeuristic {
         if n < 10 { return None; }
         let old_energy = solution.evaluate_global();
         let mut rng = rand::thread_rng();
-        let ruin_count = ((n as f64 * self.ruin_fraction) as usize).max(3).min(n / 2);
-        let ruin_count = rng.gen_range((ruin_count / 2).max(2)..=ruin_count);
+        let ruin_count_base = ((n as f64 * self.ruin_fraction) as usize).max(3).min(n / 2);
+        if ruin_count_base < 2 { return None; }
+        let ruin_count = rng.gen_range((ruin_count_base / 2).max(2)..=ruin_count_base);
         let mut indices: Vec<usize> = (0..n).collect();
         for i in 0..ruin_count.min(indices.len()) { let j = rng.gen_range(i..indices.len()); indices.swap(i, j); }
         let removed_indices: Vec<usize> = indices[..ruin_count].to_vec();
@@ -573,11 +574,15 @@ impl LowLevelHeuristic<TspSolution> for DoubleBridgeHeuristic {
         if n < 12 { return None; }
         let mut rng = rand::thread_rng();
         let quarter = n / 4;
+        if quarter < 2 { return None; }
+        let q2 = 2 * quarter;
+        let q3 = 3 * quarter;
+        if q2 <= quarter || q3 <= q2 || n <= q3 { return None; }
         let mut pts = vec![
-            rng.gen_range(1..quarter.max(2)),
-            rng.gen_range(quarter..2 * quarter),
-            rng.gen_range(2 * quarter..3 * quarter),
-            rng.gen_range(3 * quarter..n),
+            rng.gen_range(1..quarter),
+            rng.gen_range(quarter..q2),
+            rng.gen_range(q2..q3),
+            rng.gen_range(q3..n),
         ];
         pts.sort();
         let (p1, p2, p3, p4) = (pts[0], pts[1], pts[2], pts[3]);

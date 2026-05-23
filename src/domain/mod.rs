@@ -6,12 +6,13 @@
 // problem: find the shortest possible route that visits every city
 // exactly once and returns to the origin.
 //
-// v0.5 additions:
-// - Candidate edge sets for O(K) neighborhood searches
-// - Updated TspSolution with Arc<CandidateSet>
+// v0.6 additions:
+// - soa: Structure of Arrays layout with cache-aligned coordinates,
+//        packed don't-look bitmaps, and SIMD-friendly distance matrix
 
 pub mod candidates;
 pub mod heuristics;
+pub mod soa;
 
 use crate::core::Solution;
 use candidates::CandidateSet;

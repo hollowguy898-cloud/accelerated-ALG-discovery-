@@ -2,8 +2,14 @@
 // Core abstractions enforcing the domain barrier.
 // The optimization engine knows nothing about specific problem details—
 // it only tracks abstract states and energy differentials.
+//
+// v0.6 additions:
+// - hyper_ast: Self-evolving AST scoring for algorithmic discovery
+// - rl: Deep Q-Network for adaptive heuristic selection
 
 pub mod engine;
+pub mod hyper_ast;
+pub mod rl;
 
 /// A solution representation that can be evaluated for its energy (cost).
 ///
@@ -14,7 +20,7 @@ pub trait Solution: Clone + Send + Sync {
     ///
     /// This is the full O(n) re-evaluation path. Where possible,
     /// low-level heuristics should return a delta via `apply()` instead
-    /// of forcing a global re-evaluation.
+    /// of forcing a full global re-evaluation.
     fn evaluate_global(&self) -> f64;
 }
 

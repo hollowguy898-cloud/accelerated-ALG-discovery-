@@ -1,401 +1,316 @@
 # MCMC-Driven Hyper-Heuristic Optimization Framework
 
-**v0.5 "Military Logistics Demon"**
+**v0.6 "Neuro-Memetic Demon"**
 
-A research-grade, multi-threaded, MCMC-driven hyper-heuristic optimization framework written in Rust. Solves the Traveling Salesperson Problem (TSP) using a combination of state-of-the-art heuristic techniques including Lin-Kernighan variable-depth search, candidate edge pruning, iterated local search, parallel tempering, and adaptive heuristic selection.
+A research-grade, multi-threaded, neuro-memetic hyper-heuristic optimization framework written in Rust. Solves the Traveling Salesperson Problem (TSP) using a combination of Deep Q-Network (DQN) heuristic selection, self-evolving AST acceptance scoring, Structure of Arrays (SoA) cache-aligned data layouts, lock-free ring buffer information exchange, and adaptive parallel tempering — all built on top of the v0.5 research-grade heuristic lineup (Lin-Kernighan, candidate-pruned 2-opt/3-opt, ILS, elite pool).
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [What's New in v0.6](#whats-new-in-v06)
 - [Architecture](#architecture)
 - [How It Works](#how-it-works)
-  - [Two-Layer Hyper-Heuristic Model](#two-layer-hyper-heuristic-model)
-  - [Domain Barrier](#domain-barrier)
-  - [MCMC Acceptance Criterion](#mcmc-acceptance-criterion)
-  - [3-Phase Optimization Pipeline](#3-phase-optimization-pipeline)
+  - [DQN Heuristic Selection](#dqn-heuristic-selection)
+  - [Self-Evolving AST Hyper-Mode](#self-evolving-ast-hyper-mode)
+  - [SoA Data Layout with SIMD-Friendly Alignment](#soa-data-layout-with-simd-friendly-alignment)
+  - [Lock-Free Ring Buffer Exchange](#lock-free-ring-buffer-exchange)
+  - [Adaptive Temperature Ladder](#adaptive-temperature-ladder)
+  - [4-Phase Optimization Pipeline](#4-phase-optimization-pipeline)
 - [Low-Level Heuristics](#low-level-heuristics)
-  - [Tier 1: Research-Grade Heuristics](#tier-1-research-grade-heuristics)
-  - [Tier 2: Established Heuristics](#tier-2-established-heuristics)
-- [Candidate Edge Sets](#candidate-edge-sets)
-- [Engine Features](#engine-features)
-  - [Choice Function Selection](#choice-function-selection)
-  - [Adaptive Cooling](#adaptive-cooling)
-  - [Deep Local Search Chains](#deep-local-search-chains)
-  - [Reheat Mechanism](#reheat-mechanism)
-- [Elite Pool & Parallel Tempering](#elite-pool--parallel-tempering)
 - [Running](#running)
-- [Stress Testing & Benchmarks](#stress-testing--benchmarks)
-- [Key Design Decisions](#key-design-decisions)
+- [Stress Test Results](#stress-test-results)
 - [Project Structure](#project-structure)
+- [Key Design Decisions](#key-design-decisions)
 - [License](#license)
 
 ---
 
 ## Overview
 
-This framework implements a **hyper-heuristic** approach to combinatorial optimization: rather than using a single search strategy, a high-level controller (the MCMC engine) selects among multiple low-level heuristics at runtime based on their recent performance. The engine is completely domain-agnostic — it operates on abstract energy values and never touches problem-specific data structures.
+This framework implements a **neuro-memetic hyper-heuristic** approach to combinatorial optimization. Unlike v0.5 which used a static choice function formula (α×perf + β×time_since), v0.6 replaces the heuristic selection with a Deep Q-Network that learns contextual policies from a 14-dimensional search state vector, and optionally modulates acceptance decisions using self-evolving Abstract Syntax Trees.
 
-The TSP implementation demonstrates this architecture with 9 low-level heuristics spanning from simple swaps to Lin-Kernighan variable-depth search, all coordinated by a choice-function-driven MCMC engine running across multiple parallel search chains with shared elite memory.
+The key insight: a static formula can't capture the complex, context-dependent relationships between search state and optimal heuristic choice. A neural network can learn patterns like "when temperature is low and 2-opt stalls for 50 iterations, trigger a Double-Bridge kick on elite solutions, then spike the temperature of Chain 2" — and it evaluates in sub-microseconds because it's a raw tensor computation, not text generation.
 
-**Why this approach?** Single heuristics get trapped in local optima. Different heuristics excel at different stages of the search — 2-opt is great for initial improvement, ruin-recreate is essential for escaping plateaus, and Lin-Kernighan pushes solutions to near-optimal quality. The hyper-heuristic layer learns which heuristic to apply and when, adapting dynamically as the search progresses.
+---
+
+## What's New in v0.6
+
+| Feature | v0.5 | v0.6 |
+|---------|------|------|
+| Heuristic selection | Static choice function (α×perf + β×time) | DQN neural network + epsilon-greedy |
+| Acceptance scoring | Fixed Metropolis-Hastings | AST-modulated (optional) |
+| Data layout | Vec<usize> + Vec<bool> | SoA cache-aligned f32 + packed u64 bitmaps |
+| Inter-chain exchange | Mutex<ElitePool> only | Lock-free ring buffers + path fragment injection |
+| Temperature ladder | Hardcoded [20, 60, 180, 540] | Adaptive (swap-rate-driven adjustment) |
+| Don't-look bits | Vec<bool> (1 byte/city) | Packed u64 bitmaps (1 bit/city) |
+| Coordinate storage | Vec<City> (AoS) | Aligned Vec<f32> X/Y (SoA, 64-byte alignment) |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR (main.rs)                    │
-│  Phase 1: Multi-start Greedy NN                             │
-│  Phase 2: 2-opt preprocessing to local optimum              │
-│  Phase 3: Parallel ILS with elite pool migration            │
-│                                                             │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        │
-│  │  Thread 0    │ │  Thread 1    │ │  Thread 2..N │        │
-│  │  T=20        │ │  T=60        │ │  T=180,540   │        │
-│  │  ┌────────┐  │ │  ┌────────┐  │ │  ┌────────┐  │       │
-│  │  │ MCMC   │  │ │  │ MCMC   │  │ │  │ MCMC   │  │       │
-│  │  │ Engine │  │ │  │ Engine │  │ │  │ Engine │  │       │
-│  │  └───┬────┘  │ │  └───┬────┘  │ │  └───┬────┘  │       │
-│  └──────┼───────┘ └──────┼───────┘ └──────┼───────┘       │
-│         │                │                │                 │
-│         └────────────────┼────────────────┘                 │
-│                          ▼                                  │
-│                ┌─────────────────┐                          │
-│                │   ELITE POOL    │                          │
-│                │ (shared best    │                          │
-│                │  solutions)     │                          │
-│                └─────────────────┘                          │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR (main.rs) — 4 Phases                     │
+│                                                                         │
+│  Phase 1: Multi-start Greedy NN                                         │
+│  Phase 2: SoA-accelerated 2-opt preprocessing                           │
+│  Phase 3: Parallel ILS with Neuro-Memetic Engine                        │
+│  Phase 4: SoA final polish                                              │
+│                                                                         │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │
+│  │  Thread 0    │ │  Thread 1    │ │  Thread 2    │ │  Thread 3    │   │
+│  │  DQN + AST   │ │  DQN + AST   │ │  DQN + AST   │ │  DQN + AST   │   │
+│  │  T=adaptive  │ │  T=adaptive  │ │  T=adaptive  │ │  T=adaptive  │   │
+│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘   │
+│         │                │                │                │            │
+│         └────────────────┼────────────────┼────────────────┘            │
+│                          │                │                              │
+│         ┌────────────────▼────────────────▼────────────────┐            │
+│         │        LOCK-FREE RING BUFFER NETWORK              │            │
+│         │  (path fragment injection between chains)         │            │
+│         └──────────────────────────────────────────────────┘            │
+│                          │                                             │
+│         ┌────────────────▼──────────────────────────────────┐           │
+│         │     ADAPTIVE TEMPERATURE LADDER                    │           │
+│         │  (swap-rate-driven auto-adjustment)                │           │
+│         └──────────────────────────────────────────────────┘            │
+│                          │                                             │
+│         ┌────────────────▼──────────────────────────────────┐           │
+│         │          ELITE POOL (Mutex<Vec<TspSolution>>)      │           │
+│         └──────────────────────────────────────────────────┘            │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Three-Layer Code Architecture
+### Code Architecture
 
 ```
 src/
-├── main.rs                    # Entry point & 3-phase orchestrator
+├── main.rs                    # 4-phase orchestrator with all v0.6 systems
 ├── lib.rs                     # Public API re-exports
 ├── core/
 │   ├── mod.rs                 # Core traits: Solution, LowLevelHeuristic
-│   └── engine.rs              # MCMC Hyper-Heuristic engine
+│   ├── engine.rs              # MCMC engine with DQN/AST/choice function modes
+│   ├── hyper_ast.rs           # Self-evolving AST: node grammar, mutation, evaluation
+│   └── rl.rs                  # DQN agent: neural network, experience replay, reward shaping
 ├── domain/
 │   ├── mod.rs                 # TSP domain: City, TspSolution
 │   ├── candidates.rs          # Candidate edge set for O(K) neighborhood pruning
-│   └── heuristics.rs          # 9 low-level heuristics (2 tiers)
+│   ├── heuristics.rs          # 9 low-level heuristics (2 tiers)
+│   └── soa.rs                 # SoA coordinates, packed don't-look bitmaps, SoA 2-opt
 ├── infra/
-│   └── mod.rs                 # Telemetry & analytics pipeline
+│   ├── mod.rs                 # Telemetry with DQN/AST metrics
+│   └── ring_buffer.rs         # Lock-free ring buffer, exchange network, adaptive ladder
 └── bin/
     ├── quick_bench.rs         # Quick benchmark binary
-    └── stress_test.rs         # Comprehensive stress test suite
+    └── stress_test.rs         # Comprehensive stress test suite (8 sections)
 ```
-
-- **`core/`** — Domain-agnostic abstractions. The engine here knows nothing about TSP, cities, or routes. It only sees abstract energy values and heuristic names. This is the domain barrier in action.
-- **`domain/`** — TSP-specific implementation. Defines the solution representation, distance calculations, candidate edge sets, and all 9 low-level heuristics.
-- **`infra/`** — Cross-cutting concerns like telemetry, metrics collection, and convergence tracking.
-- **`bin/`** — Executable utilities for benchmarking and validation.
 
 ---
 
 ## How It Works
 
-### Two-Layer Hyper-Heuristic Model
+### DQN Heuristic Selection
 
-The framework implements a hyper-heuristic as a two-layer system:
+The DQN replaces the static choice function with a 3-layer neural network that selects heuristics based on a 14-dimensional state vector:
 
-1. **Hyper-Heuristic Layer (Manager):** The MCMC engine selects which low-level heuristic to apply at each iteration using a choice function (performance-weighted roulette wheel selection). It then decides whether to accept the proposed move using the Metropolis-Hastings acceptance criterion.
+**State vector (14 dimensions):**
+1. Temperature (log-normalized)
+2. Recent acceptance rate
+3. Stall count (log-normalized)
+4. Energy gap (current vs. best, normalized)
+5. Search progress (fraction completed)
+6-14. Per-heuristic recent performance (9 slots, tanh-normalized)
 
-2. **Low-Level Heuristics (Workers):** Nine mutation operators that modify candidate solutions in different ways — from simple city swaps to full Lin-Kernighan variable-depth search. Each heuristic returns either an O(1) delta energy (when the change affects only a constant number of edges) or `None` (triggering a full O(n) re-evaluation).
+**Network architecture:**
+```
+State[14] → Dense(14→32, ReLU) → Dense(32→32, ReLU) → Dense(32→9, linear) → Q-values[9]
+```
 
-This separation means the engine can learn which heuristics work best at any given point in the search, dynamically shifting between intensification (aggressive local improvement) and diversification (exploring new regions).
+**Training:**
+- Epsilon-greedy exploration (starts at 0.3, decays to 0.05)
+- Experience replay buffer (1000 experiences, batch size 32)
+- Target network updated every 200 decisions for stability
+- Reward shaping: positive for accepted improving moves (proportional to improvement), negative for rejected moves, bonus for diversification when stuck
 
-### Domain Barrier
+The network is implemented in pure Rust — no external ML framework needed. A single forward pass is sub-microsecond.
 
-The optimization engine is completely blind to problem-specific details. It only sees:
+### Self-Evolving AST Hyper-Mode
 
-- The current objective function score (energy)
-- The delta energy proposed by each heuristic
-- The temperature (controlling exploration vs. exploitation)
+The AST system represents algorithmic strategies as Abstract Syntax Trees that can evolve through genetic programming. Instead of a fixed acceptance formula, the AST evolves its own context-aware scoring logic.
 
-The `Solution` and `LowLevelHeuristic` traits enforce this separation at the type level. The engine never accesses route arrays, distance matrices, or city coordinates. This means you could swap in an entirely different problem domain (vehicle routing, job scheduling, graph coloring) without changing a single line in `core/`.
+**Node grammar supports:**
+- **Binary math/logic:** Add, Sub, Mul, Div (protected), Max, Min, LessThan, GreaterThan, EqualTo
+- **Conditional branching:** If cond > 0 { true_branch } else { false_branch }
+- **Local memory:** 8 register slots (AssignLocal/ReadLocal) for tracking state across evaluations
+- **Domain context:** EdgeWeight, NeighborRank, CurrentTemp, StallCount, CurrentEnergy, BestEnergy, AcceptRate, HeuristicId
+- **Constants:** f32 values for numeric parameters
 
-### MCMC Acceptance Criterion
+**Three mutation methods:**
+1. **Point mutation (40%):** Jitter constants, swap operators, change register slots
+2. **Subtree grafting (35%):** Replace a branch with a new random tree
+3. **Structural encapsulation (25%):** Push current node into a new conditional or binary wrapper
 
-The engine uses the Metropolis-Hastings algorithm as its acceptance criterion:
+**Population evolution:**
+- 20 trees per population, tournament selection (size 3)
+- Top 25% are elite (preserved), bottom 25% are culled and replaced with offspring
+- Crossover swaps subtrees between parent trees
+- Evolution happens every 2000 iterations
 
-- **If ΔE ≤ 0** (improvement): **Always accept** — the solution got better, so we keep it.
-- **If ΔE > 0** (worsening): Accept with probability **α = exp(-ΔE/T)** — the higher the temperature, the more likely we are to accept a bad move, enabling exploration.
+**How it's used:** The best AST tree evaluates the search context to produce a score that modulates the Metropolis-Hastings acceptance probability. If the AST determines the current situation is promising (e.g., high temperature + improving trend), it increases acceptance; if not, it tightens.
 
-Temperature starts high (allowing the search to explore widely) and cools over time according to an adaptive cooling schedule (exploiting near-optimal solutions). When the search stagnates, the reheat mechanism kicks the temperature back up to escape local optima.
+### SoA Data Layout with SIMD-Friendly Alignment
 
-### 3-Phase Optimization Pipeline
+The SoA module replaces the standard Array-of-Structs (AoS) layout with Structure-of-Arrays for maximum cache efficiency:
 
-The main orchestrator runs a three-phase pipeline that combines greedy construction, aggressive local search, and global exploration:
+**Coordinates:**
+- `AlignedX(Vec<f32>)` — all X coordinates in a single cache-aligned (64-byte) vector
+- `AlignedY(Vec<f32>)` — all Y coordinates in a single cache-aligned vector
+- f32 instead of f64 for faster arithmetic and better vector register utilization
+
+**Don't-look bitmaps:**
+- `DontLookBitmap` uses packed `u64` integers (64 cities per word)
+- vs. `Vec<bool>` which uses 1 byte per city (8× more memory)
+- Bitwise operations (OR, AND, NOT) check/set 64 cities at once
+- For 1000 cities: 128 bytes vs. 1000 bytes
+
+**SoA 2-opt:**
+- Uses the f32 distance matrix for faster arithmetic
+- Packed don't-look bits for skip decisions
+- Position lookup array for O(1) city-to-index resolution
+- Benchmarked at 34ms for 1000 cities (full 2-opt to local optimum)
+
+### Lock-Free Ring Buffer Exchange
+
+The `LockFreeRingBuffer` enables high-throughput, asymmetric information exchange between parallel tempering chains without any Mutex or lock:
+
+**Design:**
+- Single-producer, multi-consumer (SPSC per channel)
+- Each chain writes to its own buffer, reads from all others
+- Atomic indices for coordination (no Mutex)
+- Power-of-2 capacity for efficient modular arithmetic
+- `UnsafeCell<Box<[Option<PathFragment>]>>` with proper memory ordering
+
+**Path fragments:**
+Instead of exchanging complete solutions (expensive cloning, rarely helpful), chains exchange **path fragments** — short subsequences of cities that form good building blocks. This is inspired by the EAX (Edge Assembly Crossover) concept of preserving useful edges.
+
+**Information vaulting:**
+High-temperature chains (explorers) inject path fragments they discover. Low-temperature chains (exploiters) consume these fragments to improve their solutions. The flow is asymmetric — high-temp chains are net producers, low-temp chains are net consumers.
+
+### Adaptive Temperature Ladder
+
+The `AdaptiveLadder` dynamically adjusts the temperature spacing between parallel tempering chains based on the swap acceptance rate:
+
+- If the swap rate between adjacent chains drops below 20%, temperatures move closer together (maintaining thermodynamic throughput)
+- If the swap rate exceeds 50%, temperatures move further apart (more temperature diversity)
+- Adaptation speed controls how aggressively the ladder adjusts
+- Temperature ratio is clamped between 1.5× and 10×
+
+This ensures that solutions can always migrate between chains regardless of the energy landscape.
+
+### 4-Phase Optimization Pipeline
 
 **Phase 1: Multi-Start Greedy Nearest-Neighbor Initialization**
-- Runs 10 independent greedy nearest-neighbor constructions from random starting cities
-- Each construction builds a route by always visiting the closest unvisited city next
-- Keeps the best of the 10 starting solutions
-- Multi-starting avoids the bias of a single greedy construction
+- 10 independent greedy NN constructions from random starting cities
+- Keeps the best starting solution
 
-**Phase 2: 2-opt Preprocessing**
-- Runs the candidate-pruned 2-opt local search to local optimum on the best greedy solution
-- This alone typically improves the greedy solution by 10-20%
-- Uses don't-look bits for speed: cities that haven't produced an improvement recently are skipped
-- The result is a strong starting point for the MCMC phase
+**Phase 2: SoA-Accelerated 2-opt Preprocessing**
+- Uses the SoA data layout with packed don't-look bitmaps
+- Runs candidate-pruned 2-opt to local optimum on the best greedy solution
+- Typically improves the greedy solution by 11-16%
+- Benchmarked at sub-millisecond for 200 cities
 
-**Phase 3: Parallel ILS with Elite Pool**
-- Spawns 4 threads with a geometric temperature ladder (T = 20, 60, 180, 540) — this is parallel tempering
-- Each thread runs 3 rounds of Iterated Local Search (ILS):
-  - Round 0: Start from the 2-opt preprocessed solution
-  - Rounds 1-2: Perturb the best solution from the elite pool with a double-bridge kick, then re-optimize with 2-opt
-- Between rounds, solutions migrate to the shared elite pool
-- Each thread runs 10,000 MCMC iterations per round with all 9 heuristics active
-- The thread at the lowest temperature focuses on exploitation, while the highest-temperature thread explores aggressively
+**Phase 3: Parallel ILS with Neuro-Memetic Engine**
+- 4 threads with DQN + AST engine
+- Adaptive temperature ladder (initially [20, 60, 180, 540])
+- Lock-free path fragment exchange between chains
+- 3 ILS rounds: double-bridge perturbation → 2-opt re-optimize → MCMC optimization
+- Elite pool for sharing best solutions across chains
+
+**Phase 4: SoA Final Polish**
+- Runs SoA 2-opt one more time on the best solution found
+- Ensures the solution is at 2-opt local optimum before output
 
 ---
 
 ## Low-Level Heuristics
 
-The framework provides 9 low-level heuristics organized into two tiers by impact level.
-
-### Tier 1: Research-Grade Heuristics
-
-These are the heuristics that deliver the largest improvements and are inspired by the state of the art in TSP research.
-
-#### 1. TwoOptLocalSearch — "The King"
-
-The single most impactful heuristic for TSP. Implements candidate-pruned 2-opt local search with don't-look bits:
-
-- **How it works:** For each city in the tour, examines candidate neighbor edges for possible 2-opt improvements. When an improving move is found, it applies it and re-checks affected cities. Continues until no more improvements exist (or a single best move is applied for the single-pass variant).
-- **Complexity:** O(n × K) per pass, where K is the candidate set size (typically 20).
-- **Two modes:**
-  - `single_pass()` — Finds and applies the single best 2-opt move. Fast, ideal for MCMC iterations.
-  - `full_search()` — Runs to local optimum (no improving 2-opt moves remain). Used for preprocessing and post-perturbation re-optimization.
-- **Don't-look bits:** Cities that haven't produced an improvement in the current pass are marked and skipped in subsequent passes. When a city's neighbor is modified by an accepted move, the bit is cleared. This reduces the effective work from O(n²) to near-linear in practice.
-- **Gain criterion:** Only considers candidate edges that are shorter than the current edge, pruning the search space further.
-
-#### 2. LinKernighanHeuristic — LKH-Inspired Variable-Depth Search
-
-An iterated approach inspired by the Lin-Kernighan-Helsgaun algorithm, widely regarded as the most effective practical TSP heuristic:
-
-- **How it works:**
-  1. Runs 2-opt to local optimum (using `TwoOptLocalSearch::full_search()`)
-  2. Applies a 3-opt "kick" — breaks 3 edges and tries all 6 reconnection patterns (4 true 3-opt patterns + 2 that are special cases of 2-opt)
-  3. Re-optimizes with 2-opt after the kick
-  4. Repeats for `kick_rounds` iterations
-- **Why it works:** 2-opt alone can get stuck in local optima that 3-opt moves can escape. By alternating between aggressive local optimization (2-opt) and diversification (3-opt kicks), this heuristic explores a much larger neighborhood than either technique alone.
-- **The 6 reconnection patterns:** When 3 edges (p0→p0+1, p1→p1+1, p2→p2+1) are broken, the tour can be reconnected in 6 distinct ways — 4 are "true" 3-opt moves (involving segment reversals and rearrangements), and 2 are 2-opt moves that happen to also improve the tour. The heuristic tries all 6 and picks the best.
-
-#### 3. ThreeOptCandidate — Candidate-Pruned 3-opt Sampling
-
-Samples random 3-opt moves and applies the best one found:
-
-- **How it works:** Picks 3 random break points in the tour, tries all 6 reconnection patterns for each, and applies the best improving move found across all samples.
-- **Complexity:** O(samples × 6) per call — independent of problem size.
-- **Use case:** A lightweight way to escape 2-opt local optima without the full cost of running Lin-Kernighan. Effective when the solution is near a 2-opt minimum but still suboptimal.
-
-### Tier 2: Established Heuristics
-
-These heuristics provide diversification, fine-tuning, and escape mechanisms.
-
-#### 4. DoubleBridgeHeuristic — 4-opt Kick
-
-A structured perturbation that splits the tour into 5 segments and rearranges them (A-B-C-D-E → A-D-C-B-E):
-
-- **Why it exists:** This is the canonical ILS perturbation. Unlike random perturbations, the double-bridge is the smallest 4-opt move that cannot be undone by 2-opt. This makes it ideal for escaping 2-opt local optima permanently.
-- **Use case:** Applied between ILS rounds to generate diverse starting points for re-optimization.
-
-#### 5. RuinRecreateHeuristic — Destroy & Rebuild
-
-Removes a random fraction of cities from the tour and reinserts each at its cheapest position:
-
-- **How it works:**
-  1. Selects a random subset of cities (controlled by `ruin_fraction`, typically 15%)
-  2. Removes them from the route
-  3. Reinserts each removed city at the position that minimizes the increase in tour length (cheapest insertion heuristic)
-- **Why it works:** Large-scale destruction allows the reconstruction to find structural improvements that local moves cannot reach. This is especially effective for clustered or non-uniform city distributions.
-- **Complexity:** O(removed × remaining) per call.
-
-#### 6. OrOptHeuristic — Segment Relocation
-
-Relocates a segment of 1-3 consecutive cities to a different position in the tour:
-
-- **How it works:** Picks a random segment of length 1-3, removes it, and inserts it at a random new position.
-- **Why it works:** Or-opt is a generalization of 2-opt that can capture improvements involving city insertions that 2-opt misses (e.g., moving a single city from one part of the tour to another).
-- **Complexity:** O(n) for the full re-evaluation variant.
-
-#### 7. TwoOptBestOfK — Lightweight 2-opt Sampling
-
-Samples K random 2-opt moves and applies the best one:
-
-- **How it works:** Generates K random pairs of break points, computes the delta for each 2-opt reversal, and applies the most improving one.
-- **Complexity:** O(K) per call — very fast.
-- **Use case:** A lighter alternative to `TwoOptLocalSearch::single_pass()` that doesn't require the candidate set infrastructure. Useful when candidate sets aren't available.
-
-#### 8. InvertSegmentHeuristic — Single Random 2-opt
-
-Applies a single random 2-opt move with O(1) delta evaluation:
-
-- **How it works:** Picks two random positions in the tour and reverses the segment between them. The delta energy is computed by only examining the 2 affected edges.
-- **Complexity:** O(1) delta evaluation, O(k) for the reversal where k is the segment length.
-- **Use case:** Fine-grained perturbation. When the temperature is low and only small moves are accepted, this heuristic provides incremental improvements.
-
-#### 9. SwapCitiesHeuristic — Single Random Swap
-
-Swaps two random cities in the tour with O(1) delta evaluation:
-
-- **How it works:** Picks two random cities and swaps their positions. Handles the special case of adjacent cities (which affects 3 edges instead of 4).
-- **Complexity:** O(1) delta evaluation.
-- **Use case:** Fine-tuning. Like InvertSegment, this is most useful at low temperatures where only small perturbations are accepted.
-
----
-
-## Candidate Edge Sets
-
-The `CandidateSet` module implements the key scalability optimization from the LKH algorithm. For each city, it precomputes and stores the K nearest neighbors (default K=20).
-
-**Why this matters:** In a naive 2-opt search, every city must be checked against every other city — an O(n²) operation per pass. However, in Euclidean TSP, the best 2-opt moves almost always involve short edges. By restricting the search to only consider candidate edges, the cost drops to O(n × K) per pass.
-
-**Construction:** `CandidateSet::build(&matrix, k)` computes K nearest neighbors for each city in O(n² log K) time and O(n × K) space. This is a one-time cost that pays for itself many times over during the search.
-
-**Usage:** The `TspSolution` struct holds an `Arc<CandidateSet>` alongside the distance matrix. Heuristics like `TwoOptLocalSearch` and `ThreeOptCandidate` check whether a valid candidate set is available and use it to prune their neighborhood searches. If no candidate set is available, they fall back to random sampling.
-
-**Quality impact:** Candidate pruning typically loses less than 0.5% quality compared to exhaustive search, while providing orders-of-magnitude speedup on large instances (500+ cities).
-
----
-
-## Engine Features
-
-The MCMC engine (`src/core/engine.rs`) implements several advanced features beyond basic simulated annealing.
-
-### Choice Function Selection
-
-Instead of selecting heuristics uniformly at random, the engine uses a choice function that scores each heuristic based on:
-
-```
-score(h) = α × performance(h) + β × ln(1 + time_since_selected(h))
-```
-
-- **`performance(h)`** — An exponentially decayed moving average of the improvement delta that heuristic h has produced recently. Heuristics that consistently find improving moves get higher scores.
-- **`time_since_selected(h)`** — The number of iterations since heuristic h was last chosen. This exploration bonus ensures that all heuristics get tried periodically, preventing the engine from getting stuck always selecting the same heuristic.
-- **`α` (alpha, default 1.0)** — Weight for exploitation (recent performance).
-- **`β` (beta, default 0.3)** — Weight for exploration (time since last selection).
-- **`decay` (default 0.7)** — How quickly past performance is forgotten. Lower values mean faster forgetting.
-
-Selection uses **roulette wheel** (fitness proportionate) sampling with an epsilon floor to ensure even zero-score heuristics have a small chance of being selected.
-
-### Adaptive Cooling
-
-Instead of a fixed cooling rate, the engine adjusts the cooling schedule based on the recent acceptance rate:
-
-- **Target acceptance rate** (default 0.4): The engine aims to accept ~40% of proposed moves.
-- If the actual acceptance rate falls below the target, cooling slows down (the rate moves toward the ceiling, e.g., 0.99995), giving the search more time at the current temperature level to find improvements.
-- If the acceptance rate exceeds the target, cooling speeds up (the rate moves toward the floor, e.g., 0.9990), tightening exploitation.
-- The adjustment happens every 100 iterations based on a sliding window of the last 400 accept/reject decisions.
-- **Adaptation speed** (default 0.08) controls how aggressively the cooling rate changes.
-
-This prevents two common failure modes: cooling too fast (getting trapped in a poor local optimum) and cooling too slow (wasting iterations on random exploration).
-
-### Deep Local Search Chains
-
-After an improving move is accepted, the engine applies the same heuristic again up to `chain_depth` (default 2) additional times:
-
-- If the chain continues to improve the solution, it keeps going.
-- The chain breaks immediately on the first non-improving application.
-
-This exploits the observation that if a heuristic just found an improvement, the same type of move is likely to find further improvements nearby. It's a lightweight form of variable-depth search that amplifies the impact of each accepted move without the overhead of full local search.
-
-### Reheat Mechanism
-
-When the search stagnates (no improvement for `stagnation_limit` iterations, default 3000), the engine:
-
-1. Resets the current solution back to the best solution found so far
-2. Reheats the temperature to `initial_temp × reheat_fraction` (default 0.5, so half the initial temperature)
-3. Halves all heuristic performance scores to give underperforming heuristics a fresh chance
-4. Resumes the search from this higher-energy starting point
-
-Up to `max_reheats` (default 3) reheats are allowed per run. This mechanism ensures the search can escape deep local optima that the adaptive cooling alone cannot overcome.
-
----
-
-## Elite Pool & Parallel Tempering
-
-The orchestrator implements two complementary strategies for global search:
-
-### Elite Pool
-
-A thread-safe shared pool that maintains the best solutions found across all parallel search chains:
-
-- **Size:** Capped at `2 × num_threads` solutions
-- **Deduplication:** Solutions with energy within 0.01 of an existing entry are rejected
-- **Sorted:** Solutions are maintained in ascending order by energy, so the best is always at position 0
-- **Migration:** After each ILS round, every thread adds its best solution to the pool. In the next round, thread 0 starts from the pool's best solution, while other threads start from random elite solutions for diversity.
-
-### Parallel Tempering
-
-Four threads run simultaneously at different temperatures on a geometric ladder:
-
-| Thread | Temperature | Role |
-|--------|-------------|------|
-| 0 | 20 | Low-temp exploitation — makes small, careful improvements |
-| 1 | 60 | Moderate exploration — balances improvement and diversification |
-| 2 | 180 | Active exploration — accepts larger worsening moves |
-| 3 | 540 | High-temp diversification — explores widely, rarely improves directly |
-
-The geometric spacing (factor of 3×) ensures that each temperature level covers a different range of the energy landscape. Low-temperature threads refine the best solutions found by higher-temperature threads, while high-temperature threads discover new regions that lower temperatures would never reach.
+The framework provides 9 low-level heuristics organized into two tiers:
+
+### Tier 1: Research-Grade
+
+| Heuristic | Description | Complexity |
+|-----------|-------------|------------|
+| **TwoOptLocalSearch** | Candidate-pruned 2-opt + don't-look bits. Single-pass or full-search modes. | O(n×K)/pass |
+| **LinKernighanHeuristic** | Iterated 2-opt + 3-opt kick. Tries all 6 reconnection patterns per kick. | O(kick_rounds × n×K) |
+| **ThreeOptCandidate** | Samples N random 3-opt moves, applies best. 6 reconnection patterns. | O(samples × 6) |
+
+### Tier 2: Established
+
+| Heuristic | Description | Complexity |
+|-----------|-------------|------------|
+| **DoubleBridgeHeuristic** | 4-opt kick (A-B-C-D-E → A-D-C-B-E). Cannot be undone by 2-opt. | O(n) |
+| **RuinRecreateHeuristic** | Removes 15% of cities, reinserts at cheapest positions. | O(removed × remaining) |
+| **OrOptHeuristic** | Relocates 1-3 city segments to new positions. | O(n) |
+| **TwoOptBestOfK** | Samples K random 2-opt moves, picks the best. | O(K) |
+| **InvertSegmentHeuristic** | Single random 2-opt move with O(1) delta. | O(1) delta |
+| **SwapCitiesHeuristic** | Single random swap with O(1) delta. Handles adjacent cities. | O(1) delta |
 
 ---
 
 ## Running
 
 ### Default Demo (60 circular cities)
-
 ```bash
 cargo run --release
 ```
 
-This runs the full 3-phase pipeline on a 60-city circular instance (where the theoretical optimum is known). It reports the gap from optimality and the total improvement over the greedy baseline.
-
 ### Quick Benchmark
-
 ```bash
 cargo run --release --bin quick_bench
 ```
 
-Benchmarks 2-opt full search, 2-opt single pass, and Lin-Kernighan on 200 and 500 city random instances. Useful for verifying that the candidate-pruned heuristics are running at expected speed.
-
 ### Comprehensive Stress Test
-
 ```bash
 cargo run --release --bin stress_test
 ```
 
-Runs 7 sections of tests covering:
-1. **2-opt local search** at 60, 200, 500, and 1000 cities
-2. **Full pipeline** (2-opt + MCMC with 9 heuristics) at 60, 200, 500 cities
-3. **Adversarial distributions** — clustered, grid, and line layouts
-4. **ILS** (double-bridge + 2-opt + MCMC, 3 rounds, 4 threads) at 200 and 500 cities
-5. **Lin-Kernighan** benchmark at 200 and 500 cities
-6. **Circular benchmark** with known theoretical optimum at 60 and 200 cities
-7. **Delta correctness** — 5,000 cross-checks verifying that heuristic-reported delta energy matches global re-evaluation
-
-The stress test reports average and best improvement vs. greedy, plus pass/fail status.
-
 ---
 
-## Key Design Decisions
+## Stress Test Results
 
-- **Domain barrier via traits:** `Solution` and `LowLevelHeuristic` traits enforce clean separation between the engine and problem domain. The engine never sees a route or a city — it only operates on `f64` energy values.
-- **O(1) delta evaluation:** Low-level heuristics return delta energy when possible (swap: 4 edges, invert: 2 edges), avoiding O(n) global re-evaluations. Heuristics that modify the solution too extensively (ruin-recreate, Or-opt) fall back to full re-evaluation by returning `None`.
-- **Zero-cost dynamic dispatch:** `Arc<dyn LowLevelHeuristic<S>>` provides clean abstraction with vtable dispatch. The `Arc` enables sharing heuristics across threads without cloning.
-- **Thread-safe shared data:** `Arc<Vec<Vec<f64>>>` for the distance matrix and `Arc<CandidateSet>` for candidate edges allow all threads to read the same data without locks or duplication.
-- **Downsampled telemetry:** Records every 500th iteration to prevent allocator stress on long runs while still providing sufficient resolution for convergence analysis.
-- **Don't-look bits:** The 2-opt local search skips cities that haven't improved recently, reducing effective work from O(n²) to near-linear in practice.
-- **Candidate pruning:** Restricts neighborhood searches to O(K) candidate edges instead of O(n), with minimal quality loss (typically <0.5%).
-- **ILS structure:** Double-bridge perturbation between rounds is the smallest 4-opt move that cannot be undone by 2-opt, making it ideal for permanent escape from 2-opt local optima.
-- **Release profile:** `opt-level = 3`, `lto = true`, `codegen-units = 1` for maximum performance. The framework is compute-bound, so these aggressive optimizations matter.
+```
+SECTION 1: SoA 2-OPT LOCAL SEARCH
+  soa_2opt_60    | +12.9% vs greedy
+  soa_2opt_200   | +11.2% vs greedy
+  soa_2opt_500   | +16.1% vs greedy
+  soa_2opt_1000  | +13.7% vs greedy (34ms)
+
+SECTION 2: DQN-DRIVEN MCMC PIPELINE
+  dqn_mcmc_60    | +14.9% vs greedy
+  dqn_mcmc_200   | +13.0% vs greedy
+  dqn_mcmc_500   | +13.9% vs greedy
+
+SECTION 3: FULL NEURO-MEMETIC (DQN + AST)
+  neuro_200      | +20.2% vs greedy
+  neuro_500      | +15.1% vs greedy
+
+SECTION 5: ILS WITH EXCHANGE NETWORK
+  ils_exchange_200 | +21.7% vs greedy
+  ils_exchange_500 | +16.7% vs greedy
+
+SECTION 6: CIRCULAR BENCHMARK
+  circ_60        | NEAR_PERFECT (0% gap)
+  circ_200       | NEAR_PERFECT (0% gap)
+
+SECTION 7: ALL UNIT TESTS PASSED
+  DQN, AST, SoA, Ring Buffer, Adaptive Ladder
+
+SECTION 8: DELTA CORRECTNESS
+  Zero drift across 5,000 cross-checks
+```
 
 ---
 
@@ -403,17 +318,34 @@ The stress test reports average and best improvement vs. greedy, plus pass/fail 
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Entry point — 3-phase orchestrator with elite pool and parallel tempering |
-| `src/lib.rs` | Public API — re-exports `core`, `domain`, `infra` modules |
-| `src/core/mod.rs` | Core traits — `Solution` (energy evaluation), `LowLevelHeuristic` (mutation + delta) |
-| `src/core/engine.rs` | MCMC engine — choice function, adaptive cooling, deep chains, reheat, Metropolis-Hastings |
-| `src/domain/mod.rs` | TSP domain — `City`, `TspSolution` with route + shared matrix + candidate set |
-| `src/domain/candidates.rs` | Candidate edge set — K nearest neighbors per city, O(n² log K) build |
-| `src/domain/heuristics.rs` | 9 heuristics — 2-opt local search, Lin-Kernighan, 3-opt, double-bridge, ruin-recreate, Or-opt, best-of-K, invert, swap |
-| `src/infra/mod.rs` | Telemetry — downsampled energy history, acceptance counts per heuristic, reheat tracking |
-| `src/bin/quick_bench.rs` | Quick benchmark — timing for 2-opt and LK on 200/500 cities |
-| `src/bin/stress_test.rs` | Stress test — 7 sections, 20+ tests, delta correctness validation |
-| `Cargo.toml` | Package config — `rand = "0.8"`, release profile with LTO |
+| `src/main.rs` | 4-phase orchestrator with DQN, AST, SoA, exchange network, adaptive ladder |
+| `src/lib.rs` | Public API — re-exports core, domain, infra modules |
+| `src/core/mod.rs` | Core traits — Solution, LowLevelHeuristic |
+| `src/core/engine.rs` | MCMC engine with DQN/AST/choice function selection modes |
+| `src/core/hyper_ast.rs` | AST node grammar, mutation engine, evaluation, population evolution |
+| `src/core/rl.rs` | DQN agent, tensor operations, experience replay, reward shaping |
+| `src/domain/mod.rs` | TSP domain — City, TspSolution |
+| `src/domain/candidates.rs` | Candidate edge set — K nearest neighbors per city |
+| `src/domain/heuristics.rs` | 9 heuristics — 2-opt, LK, 3-opt, double-bridge, ruin-recreate, Or-opt, best-of-K, invert, swap |
+| `src/domain/soa.rs` | SoA coordinates, packed don't-look bitmaps, SoA 2-opt local search |
+| `src/infra/mod.rs` | Telemetry with DQN epsilon, AST fitness, fragment exchange metrics |
+| `src/infra/ring_buffer.rs` | Lock-free ring buffer, exchange network, adaptive temperature ladder |
+| `src/bin/quick_bench.rs` | Quick benchmark — DQN MCMC + SoA 2-opt timing |
+| `src/bin/stress_test.rs` | Stress test — 8 sections, 14+ tests, unit tests, delta validation |
+| `Cargo.toml` | Package config — rand = "0.8", release profile with LTO |
+
+---
+
+## Key Design Decisions
+
+- **DQN in pure Rust:** No external ML framework needed. The 3-layer network (14→32→32→9) runs in sub-microsecond per forward pass. All tensor operations are hand-implemented with no allocation in the hot path.
+- **AST over bytecode:** The AST approach gives strongly-typed safety, compiler-friendly output, and easy visualization of what the machine is writing. No risk of misaligned pointers or register rollovers from raw bytecode mutations.
+- **Protected math in AST:** Division by near-zero returns the numerator. All results are clamped to [-1e6, 1e6]. An arbitrary AST mutation can never trigger a thread-stopping error.
+- **SoA for cache density:** Storing all X coordinates contiguously and all Y coordinates contiguously means a single cache line holds 16 f32 values. Scanning coordinates for distance computation becomes near-optimal.
+- **Packed bitmaps:** 64 cities per u64 means the entire don't-look bitmap for a 1000-city instance fits in 128 bytes — comfortably within L1 cache.
+- **Lock-free exchange:** The ring buffer uses atomic indices + UnsafeCell with proper Release/Acquire ordering. No Mutex in the hot path.
+- **Fragment injection over solution cloning:** Exchanging building blocks (5-city path fragments) is more informative than exchanging complete solutions, and much cheaper.
+- **Adaptive ladder over hardcoded temperatures:** The swap-rate feedback loop ensures the temperature ladder stays effective regardless of the energy landscape.
 
 ---
 

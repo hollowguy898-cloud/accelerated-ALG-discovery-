@@ -1,17 +1,11 @@
 // src/infra/mod.rs
-// Telemetry and Analytics Pipeline
+// Telemetry, Analytics Pipeline, and Information Exchange Infrastructure
 //
-// Production optimization frameworks require metrics to audit performance,
-// diagnose exploration bottlenecks, and trace convergence behavior.
-//
-// Key design decisions:
-// - **Downsampled storage**: Rather than recording every iteration (which
-//   causes allocator stress for long runs), telemetry records every 500th
-//   iteration, keeping memory usage O(max_iterations / 500).
-// - **Heuristic acceptance tracking**: Records which heuristics are being
-//   accepted most often, enabling analysis of which mutation strategies
-//   are most effective at each phase of the search.
-// - **Reheat tracking**: Records how many times the reheat mechanism fired.
+// v0.6 additions:
+// - ring_buffer: Lock-free ring buffer for asymmetric elite injection
+// - Adaptive temperature ladder integrated into ring_buffer module
+
+pub mod ring_buffer;
 
 use std::collections::HashMap;
 
@@ -22,6 +16,8 @@ use std::collections::HashMap;
 /// 2. **Acceptance counts**: How many times each low-level heuristic's proposed
 ///   solution was accepted by the MCMC criterion
 /// 3. **Reheat count**: How many times the reheat mechanism was triggered
+/// 4. **RL training metrics**: DQN loss, epsilon, average Q-value
+/// 5. **AST population fitness**: Average and best tree fitness
 pub struct Telemetry {
     /// Downsampled history of energy values: (iteration, current_energy, best_energy)
     pub energy_history: Vec<(usize, f64, f64)>,
@@ -29,14 +25,18 @@ pub struct Telemetry {
     pub acceptance_counts: HashMap<String, usize>,
     /// Number of times the reheat mechanism was triggered
     pub reheat_count: usize,
+    /// DQN epsilon (exploration rate) at end of run
+    pub dqn_epsilon: f32,
+    /// Best AST tree fitness at end of run
+    pub best_ast_fitness: f64,
+    /// Average AST population fitness
+    pub avg_ast_fitness: f64,
+    /// Number of fragment exchanges across chains
+    pub fragment_exchanges: usize,
 }
 
 impl Telemetry {
     /// Creates a new telemetry instance with pre-allocated capacity.
-    ///
-    /// # Arguments
-    /// * `capacity` - Estimated total iterations (used for pre-allocation)
-    /// * `initial_energy` - The starting energy of the initial solution
     pub fn new(capacity: usize, initial_energy: f64) -> Self {
         let mut history = Vec::with_capacity(capacity / 100);
         history.push((0, initial_energy, initial_energy));
@@ -44,13 +44,14 @@ impl Telemetry {
             energy_history: history,
             acceptance_counts: HashMap::new(),
             reheat_count: 0,
+            dqn_epsilon: 1.0,
+            best_ast_fitness: 0.0,
+            avg_ast_fitness: 0.0,
+            fragment_exchanges: 0,
         }
     }
 
     /// Records that a heuristic's proposed move was accepted.
-    ///
-    /// This is called every time the Metropolis-Hastings criterion
-    /// accepts a move, regardless of whether it improved the best solution.
     pub fn record_acceptance(&mut self, name: &str) {
         *self
             .acceptance_counts
@@ -64,9 +65,6 @@ impl Telemetry {
     }
 
     /// Updates the energy history (downsampled to every 500 iterations).
-    ///
-    /// Downsampling prevents excessive memory allocation while still
-    /// providing sufficient resolution for convergence analysis.
     pub fn update_history(&mut self, iter: usize, current: f64, best: f64) {
         if iter % 500 == 0 {
             self.energy_history.push((iter, current, best));
