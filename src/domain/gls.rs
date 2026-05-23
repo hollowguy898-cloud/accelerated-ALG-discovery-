@@ -24,7 +24,7 @@
 // edges "more expensive" temporarily. When the penalty is removed, the
 // solution snaps back toward true optimality.
 
-use crate::core::Solution;
+use crate::core::{PenaltyEscape, Solution};
 use crate::domain::TspSolution;
 use std::collections::HashMap;
 
@@ -306,4 +306,66 @@ pub fn auto_lambda(matrix: &[Vec<f64>], alpha: f64) -> f64 {
 
     let avg_dist = if count > 0 { sum / count as f64 } else { 1.0 };
     alpha * avg_dist
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PenaltyEscape TRAIT IMPLEMENTATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Implement the domain-agnostic `PenaltyEscape` trait for `GuidedLocalSearch`.
+///
+/// This is the bridge that lets the generic MCMC engine use GLS penalties
+/// for acceptance decisions without knowing anything about TSP or edges.
+/// The engine calls `augmented_energy()` instead of `evaluate_global()`
+/// in its Metropolis-Hastings criterion, and calls `penalize()` when
+/// stagnation is detected instead of simply resetting temperature.
+impl PenaltyEscape<TspSolution> for GuidedLocalSearch {
+    fn augmented_energy(&self, solution: &TspSolution) -> f64 {
+        // E_augmented = E_original + λ × Σ(Penalty(i,j) × Distance(i,j))
+        let original = solution.evaluate_global();
+        let penalty_cost = self.penalty_cost(solution);
+        original + self.lambda * penalty_cost
+    }
+
+    fn penalize(&mut self, solution: &TspSolution) -> usize {
+        // Penalize the top-3 highest-utility edges
+        // (aggressive variant for faster escape from deep local optima)
+        let penalized = self.penalize_top_k_edges(solution, 3);
+        self.iterations_since_penalty = 0;
+        penalized.len()
+    }
+
+    fn should_penalize(&self, iterations_since_improvement: usize) -> bool {
+        iterations_since_improvement >= self.stagnation_threshold
+            && self.iterations_since_penalty >= self.penalty_interval
+    }
+
+    fn decay_penalties(&mut self, decay_factor: f64) {
+        for penalty in self.penalties.values_mut() {
+            *penalty = (*penalty as f64 * decay_factor).ceil() as u32;
+        }
+        self.penalties.retain(|_, v| *v > 0);
+    }
+
+    fn reset_penalties(&mut self) {
+        self.penalties.clear();
+        self.total_penalties = 0;
+        self.iterations_since_penalty = 0;
+    }
+
+    fn num_penalized(&self) -> usize {
+        self.penalties.len()
+    }
+
+    fn total_penalty_count(&self) -> usize {
+        self.total_penalties
+    }
+
+    fn tick(&mut self) {
+        self.iterations_since_penalty += 1;
+    }
+
+    fn reset_penalty_timer(&mut self) {
+        self.iterations_since_penalty = 0;
+    }
 }

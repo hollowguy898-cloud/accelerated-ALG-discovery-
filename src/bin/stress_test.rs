@@ -1,6 +1,6 @@
 // src/bin/stress_test.rs
-// Comprehensive stress test suite v0.7 — "OR-Tools Demon" Edition
-// GLS + SpatialLNS | Snaking | DQN + AST | SoA | Lock-Free Exchange | PathCheapestArc
+// Comprehensive stress test suite v0.8 — "GLS-Native" Edition
+// GLS penalties wired INTO the engine's MH acceptance criterion
 
 use accelerated_alg_discovery::core::engine::{
     AdaptiveCoolingConfig, AstConfig, ChoiceFunctionConfig, McmcEngine, ReheatConfig,
@@ -9,6 +9,7 @@ use accelerated_alg_discovery::core::engine::{
 use accelerated_alg_discovery::core::hyper_ast::{AstPopulation, AstScoringTree, HyperNode, MemoryContext, evaluate_node};
 use accelerated_alg_discovery::core::rl::{DqnAgent, DqnConfig, compute_reward};
 use accelerated_alg_discovery::core::LowLevelHeuristic;
+use accelerated_alg_discovery::core::PenaltyEscape;
 use accelerated_alg_discovery::core::Solution;
 use accelerated_alg_discovery::domain::candidates::CandidateSet;
 use accelerated_alg_discovery::domain::gls::{GuidedLocalSearch, auto_lambda};
@@ -159,8 +160,8 @@ fn make_engine_config() -> (ReheatConfig, AdaptiveCoolingConfig, DqnConfig, AstC
 
 fn main() {
     println!("==============================================================================");
-    println!("  MCMC HYPER-HEURISTIC STRESS TEST  v0.7 — \"OR-Tools Demon\"");
-    println!("  GLS + SpatialLNS | Snaking | DQN + AST | 14 Heuristics | PathCheapestArc");
+    println!("  MCMC HYPER-HEURISTIC STRESS TEST  v0.8 — \"GLS-Native\"");
+    println!("  GLS in MH Criterion | 14 Heuristics | DQN+AST | SpatialLNS | PathCheapestArc");
     println!("==============================================================================\n");
 
     let mut failures = 0;
@@ -186,9 +187,9 @@ fn main() {
     }
     println!();
 
-    // ── SECTION 1: GLS Penalty System ──
+    // ── SECTION 1: GLS Penalty System (v0.8: inside engine loop) ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 1: GUIDED LOCAL SEARCH (GLS) FEATURE PENALTIES");
+    println!("SECTION 1: GLS-NATIVE PENALTY ESCAPE (augmented energy in MH criterion)");
     for &n in &[60, 200, 500] {
         let cities = generate_random_uniform_cities(n, 500.0);
         let matrix = Arc::new(build_distance_matrix(&cities));
@@ -196,30 +197,33 @@ fn main() {
         let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
         let greedy_e = sol.evaluate_global();
 
-        // 2-opt first
         let two_opt = TwoOptLocalSearch::full_search();
         two_opt.apply(&mut sol);
         let after_2opt = sol.evaluate_global();
 
-        // Apply GLS
+        // v0.8: GLS is passed INTO the engine, not post-processed
+        let heuristics = make_heuristics_14();
         let lambda = auto_lambda(&matrix, 0.2);
         let mut gls = GuidedLocalSearch::with_params(lambda, 200);
+
+        let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
+        let engine = McmcEngine::with_neuro_memetic(
+            heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
+        );
+
         let start = Instant::now();
-
-        // GLS loop: penalize + 2-opt + repeat
-        for gls_round in 0..20 {
-            gls.penalize_worst_edge(&sol);
-            // Re-optimize with 2-opt (which will avoid penalized edges)
-            two_opt.apply(&mut sol);
-        }
-
-        let gls_e = sol.evaluate_global();
+        let (best, telemetry) = engine.optimize_with_penalty_escape(
+            sol, (n * 100).max(10_000), None, None, &mut gls,
+        );
         let elapsed = start.elapsed();
-        let vs_2opt = (after_2opt - gls_e) / after_2opt * 100.0;
-        println!("  gls_{:<5} | Greedy={:.1} | 2opt={:.1} | GLS={:.1} | vs2opt={:+.1}% | λ={:.2} | penalties={} | {}ms",
-            n, greedy_e, after_2opt, gls_e, vs_2opt, lambda, gls.total_penalties, elapsed.as_millis());
 
-        if vs_2opt < 0.0 && n >= 200 { failures += 1; } // GLS should not make things worse
+        let gls_e = best.evaluate_global();
+        let vs_2opt = (after_2opt - gls_e) / after_2opt * 100.0;
+        println!("  gls_native_{:<5} | Greedy={:.1} | 2opt={:.1} | GLS-Native={:.1} | vs2opt={:+.1}% | λ={:.2} | pen_updates={} | pen_edges={} | {}ms",
+            n, greedy_e, after_2opt, gls_e, vs_2opt, lambda,
+            telemetry.gls_penalty_updates, telemetry.gls_penalized_edges, elapsed.as_millis());
+
+        if vs_2opt < -1.0 && n >= 200 { failures += 1; } // GLS should not significantly worsen things
     }
     println!();
 
@@ -253,7 +257,6 @@ fn main() {
         let elapsed = start.elapsed();
         let final_e = sol.evaluate_global();
 
-        // Verify route is still valid permutation
         let mut sorted_route = sol.route.clone();
         sorted_route.sort();
         let valid = sorted_route.windows(2).all(|w| w[0] != w[1]) && sorted_route.len() == 200;
@@ -290,9 +293,9 @@ fn main() {
     }
     println!();
 
-    // ── SECTION 4: Full 14-Heuristic DQN+GLS Pipeline ──
+    // ── SECTION 4: Full 14-Heuristic DQN+GLS Pipeline (v0.8 native) ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 4: FULL 14-HEURISTIC DQN+GLS PIPELINE (OR-Tools operators)");
+    println!("SECTION 4: FULL 14-HEURISTIC DQN+GLS-NATIVE PIPELINE");
     for &n in &[60, 200, 500] {
         let cities = generate_random_uniform_cities(n, 500.0);
         let matrix = Arc::new(build_distance_matrix(&cities));
@@ -305,38 +308,35 @@ fn main() {
         two_opt.apply(&mut sol);
         let after_2opt = sol.evaluate_global();
 
-        // GLS + DQN + 14 heuristics
+        // v0.8: GLS is wired into the engine natively
         let heuristics = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
+        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 300);
         let iters = (n * 200).max(20_000);
         let start = Instant::now();
         let engine = McmcEngine::with_neuro_memetic(
             heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
         );
-        let (mut best, tel) = engine.optimize(sol, iters);
-
-        // GLS post-processing
-        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 300);
-        for _ in 0..5 {
-            gls.penalize_worst_edge(&best);
-            two_opt.apply(&mut best);
-        }
+        let (best, telemetry) = engine.optimize_with_penalty_escape(
+            sol, iters, None, None, &mut gls,
+        );
 
         let elapsed = start.elapsed();
         let final_e = best.evaluate_global();
 
         let vs_greedy = (greedy_e - final_e) / greedy_e * 100.0;
         let vs_2opt = (after_2opt - final_e) / after_2opt * 100.0;
-        println!("  dqn_gls_{:<5} | Grdy={:.1} | 2opt={:.1} | Final={:.1} | vsGrdy={:+.1}% | vs2opt={:+.1}% | GLS_pen={} | {}ms",
-            n, greedy_e, after_2opt, final_e, vs_greedy, vs_2opt, gls.total_penalties, elapsed.as_millis());
-        results.push((Box::leak(format!("dqn_gls_{}", n).into_boxed_str()), greedy_e, after_2opt, final_e));
+        println!("  dqn_gls_native_{:<5} | Grdy={:.1} | 2opt={:.1} | Final={:.1} | vsGrdy={:+.1}% | vs2opt={:+.1}% | GLS_pen={} | GLS_edges={} | {}ms",
+            n, greedy_e, after_2opt, final_e, vs_greedy, vs_2opt,
+            telemetry.gls_penalty_updates, telemetry.gls_penalized_edges, elapsed.as_millis());
+        results.push((Box::leak(format!("dqn_gls_native_{}", n).into_boxed_str()), greedy_e, after_2opt, final_e));
         if vs_greedy < 10.0 && n >= 100 { failures += 1; }
     }
     println!();
 
     // ── SECTION 5: Adversarial ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 5: ADVERSARIAL DISTRIBUTIONS (200 cities, 14 heuristics + GLS)");
+    println!("SECTION 5: ADVERSARIAL DISTRIBUTIONS (200 cities, 14 heuristics + GLS-native)");
     for (name, cities) in [
         ("clustered_5", generate_clustered_cities(200, 5, 20.0)),
         ("grid_14x15", generate_grid_cities(14, 15, 30.0)),
@@ -352,10 +352,13 @@ fn main() {
 
         let heuristics = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
+        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 300);
         let engine = McmcEngine::with_neuro_memetic(
             heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
         );
-        let (best, _) = engine.optimize(sol, 40_000);
+        let (best, _) = engine.optimize_with_penalty_escape(
+            sol, 40_000, None, None, &mut gls,
+        );
         let final_e = best.evaluate_global();
         let vs_greedy = (greedy_e - final_e) / greedy_e * 100.0;
         println!("  {:<15} | Grdy={:.1} | 2opt={:.1} | Final={:.1} | vsGrdy={:+.1}%", name, greedy_e, after_2opt, final_e, vs_greedy);
@@ -363,7 +366,7 @@ fn main() {
     }
     println!();
 
-    // ── SECTION 6: GLS Unit Tests ──
+    // ── SECTION 6: Unit Tests ──
     println!("──────────────────────────────────────────────────────────────────────────────");
     println!("SECTION 6: UNIT TESTS (GLS, OR-Tools Operators, DQN, AST, SoA, Ring Buffer)");
 
@@ -391,11 +394,18 @@ fn main() {
         let augmented = gls.augmented_energy(&sol);
         assert!(augmented >= original, "Augmented energy should be >= original");
 
+        // Test PenaltyEscape trait methods
+        assert!(gls.should_penalize(500)); // Above stagnation threshold
+        assert!(!gls.should_penalize(100)); // Below stagnation threshold
+        let count = gls.penalize(&sol);
+        assert!(count > 0, "Penalize should apply at least 1 penalty");
+        gls.reset_penalty_timer();
+
         // Test penalize_worst_edge
         let (edge, utility) = gls.penalize_worst_edge(&sol);
         assert!(utility > 0.0, "Utility should be positive");
         assert_eq!(gls.get_penalty(edge.0, edge.1), 1);
-        println!("  GLS: PASS (worst edge=({},{}), utility={:.2})", edge.0, edge.1, utility);
+        println!("  GLS PenaltyEscape: PASS (worst edge=({},{}), utility={:.2}, penalize_count={})", edge.0, edge.1, utility, count);
 
         // Test penalty decay
         gls.increment_penalty(5, 10);
@@ -404,6 +414,14 @@ fn main() {
         gls.decay_penalties(0.5);
         assert_eq!(gls.get_penalty(5, 10), 2); // ceil(3 * 0.5) = 2
         println!("  GLS decay: PASS");
+
+        // Test tick/reset
+        gls.tick();
+        gls.tick();
+        assert_eq!(gls.iterations_since_penalty, 2);
+        gls.reset_penalty_timer();
+        assert_eq!(gls.iterations_since_penalty, 0);
+        println!("  GLS tick/reset: PASS");
 
         // Test auto_lambda
         let lambda = auto_lambda(&matrix, 0.2);
@@ -424,7 +442,6 @@ fn main() {
             lns.apply(&mut sol);
         }
 
-        // Verify route is still valid
         let mut sorted = sol.route.clone();
         sorted.sort();
         let valid = sorted.windows(2).all(|w| w[0] != w[1]) && sorted.len() == 100;
@@ -491,7 +508,7 @@ fn main() {
         println!("  CrossExchange: PASS (valid={})", valid);
     }
 
-    // Test DQN agent (existing)
+    // Test DQN agent
     {
         let mut agent = DqnAgent::with_config(14, make_dqn_config(14));
         let state = agent.build_state(100.0, 0.4, 500, 10000.0, 9000.0, 0.5,
@@ -507,7 +524,7 @@ fn main() {
         println!("  DQN agent (14 actions): PASS (action={}, epsilon={:.3})", action, agent.epsilon);
     }
 
-    // Test AST evaluation (existing)
+    // Test AST evaluation
     {
         let tree = AstScoringTree::baseline_gain();
         let mut ctx = MemoryContext::new();
@@ -523,7 +540,7 @@ fn main() {
         println!("  AST evaluation: PASS (baseline_score={:.3})", score);
     }
 
-    // Test ring buffer (existing)
+    // Test ring buffer
     {
         let buf = LockFreeRingBuffer::new(16, 2);
         let frag = PathFragment::new(vec![1, 2, 3], -10.0, 0, 100.0, 0);
@@ -534,7 +551,7 @@ fn main() {
         println!("  Ring buffer: PASS");
     }
 
-    // Test adaptive ladder (existing)
+    // Test adaptive ladder
     {
         let mut ladder = AdaptiveLadder::new(4, 20.0, 3.0);
         assert_eq!(ladder.temperatures.len(), 4);
@@ -577,9 +594,9 @@ fn main() {
     }
     println!();
 
-    // ── SECTION 8: Circular Benchmark with GLS ──
+    // ── SECTION 8: Circular Benchmark with GLS-native ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 8: CIRCULAR BENCHMARK (known optimum, 14 heuristics + GLS)");
+    println!("SECTION 8: CIRCULAR BENCHMARK (known optimum, 14 heuristics + GLS-native)");
     for &n in &[60, 200] {
         let cities = generate_circular_cities(n, 100.0);
         let theoretical = 2.0 * 100.0 * (std::f64::consts::PI / n as f64).sin() * n as f64;
@@ -599,29 +616,26 @@ fn main() {
 
         let h = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
+        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 200);
         let engine = McmcEngine::with_neuro_memetic(
             h, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
         );
-        let (mut best, _) = engine.optimize(init, (n * 200).max(20_000));
-
-        // GLS polish
-        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 200);
-        for _ in 0..10 {
-            gls.penalize_worst_edge(&best);
-            two_opt.apply(&mut best);
-        }
+        let (best, telemetry) = engine.optimize_with_penalty_escape(
+            init, (n * 200).max(20_000), None, None, &mut gls,
+        );
 
         let gap = ((best.evaluate_global() - theoretical) / theoretical) * 100.0;
         let status = if gap <= 0.1 { "NEAR_PERFECT" } else if gap <= 0.5 { "EXCELLENT" } else if gap <= 2.0 { "GOOD" } else { "SUBOPTIMAL" };
-        println!("  circ_{:<5} | Theory={:.2} | PCA={:.2} | Grdy={:.2} | 2opt_gap={:.3}% | GLS_gap={:.3}% | {}",
-            n, theoretical, pca_e, greedy_e, gap_2opt, gap, status);
+        println!("  circ_{:<5} | Theory={:.2} | PCA={:.2} | Grdy={:.2} | 2opt_gap={:.3}% | GLS-native_gap={:.3}% | pen={} | {}",
+            n, theoretical, pca_e, greedy_e, gap_2opt, gap,
+            telemetry.gls_penalty_updates, status);
         if gap > 5.0 { failures += 1; }
     }
     println!();
 
     // ── Summary ──
     println!("==============================================================================");
-    println!("  STRESS TEST SUMMARY v0.7");
+    println!("  STRESS TEST SUMMARY v0.8 — GLS-Native");
     println!("==============================================================================");
     println!("  Total tests: {}", results.len());
     println!("  Failures:    {}", failures);

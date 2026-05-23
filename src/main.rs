@@ -1,16 +1,15 @@
 // src/main.rs
-// MCMC-driven Hyper-Heuristic Framework v0.7 — "OR-Tools Demon"
+// MCMC-driven Hyper-Heuristic Framework v0.8 — "GLS-Native"
 //
-// v0.7 is the OR-Tools integration upgrade:
-// - Guided Local Search (GLS) feature penalties replace simple reheat
-// - Spatial-Clustered LNS replaces random ruin-recreate
-// - RelocateNeighbors "snaking" operator
-// - Relocate/Exchange/CrossExchange segment operators
-// - Path-Cheapest-Arc initialization (isolation-aware)
-// - All v0.6 features preserved (DQN, AST, SoA, lock-free exchange, adaptive tempering)
+// v0.8: GLS penalties are now wired directly into the MCMC engine's
+// acceptance criterion. When the engine encounters stagnation, it
+// penalizes high-utility edges INSIDE the loop, and the Metropolis-
+// Hastings criterion uses augmented energy. This means penalized edges
+// are genuinely "expensive" during search — not just post-processed.
 //
 // Architecture:
-//   RL-driven selection (DQN) + AST-modulated acceptance + GLS penalty escape
+//   RL-driven selection (DQN) + AST-modulated acceptance
+//   + GLS-native penalty escape (augmented energy in MH criterion)
 //   + Spatial LNS diversification + Snaking relocation + Candidate pruning
 //   + Lock-free fragment exchange + Adaptive tempering
 
@@ -106,8 +105,8 @@ impl ElitePool {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  MCMC-Driven Hyper-Heuristic Framework  v0.7                           ║");
-    println!("║  OR-Tools Demon                                                        ║");
+    println!("║  MCMC-Driven Hyper-Heuristic Framework  v0.8                           ║");
+    println!("║  GLS-NATIVE — Augmented Energy in MH Criterion                        ║");
     println!("║  GLS + SpatialLNS | Snaking | DQN + AST | SoA | Lock-Free Exchange    ║");
     println!("║  PathCheapestArc | Relocate/Exchange/Cross | Adaptive Tempering        ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
@@ -133,7 +132,6 @@ fn main() {
     // ── Phase 1: Path-Cheapest-Arc initialization (OR-Tools smart init) ──
     println!("Phase 1: Path-Cheapest-Arc initialization (OR-Tools isolation-aware)...");
 
-    // Multi-start with both greedy NN and path-cheapest-arc
     let num_starts = 5;
     let mut best_init: Option<TspSolution> = None;
     let mut best_init_energy = f64::MAX;
@@ -192,8 +190,8 @@ fn main() {
     println!("  SoA 2-opt time: {:?}", soa_elapsed);
     println!("  SoA improvement: {:.2}", soa_improvement);
 
-    // ── Phase 3: Parallel ILS with GLS + OR-Tools Operators ──
-    println!("\nPhase 3: Parallel ILS with GLS + OR-Tools Operators...");
+    // ── Phase 3: Parallel ILS with GLS-NATIVE escape ──
+    println!("\nPhase 3: Parallel ILS with GLS-NATIVE escape (augmented energy in MH)...");
 
     // 14 heuristics — the full research-grade OR-Tools lineup
     let heuristics: Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> = vec![
@@ -229,12 +227,6 @@ fn main() {
     let ladder = Arc::new(Mutex::new(AdaptiveLadder::new(num_threads, 20.0, 3.0)));
     let exchange = Arc::new(ExchangeNetwork::new(num_threads, 64));
 
-    // GLS state (shared across all chains for consistent penalty landscape)
-    let gls = Arc::new(Mutex::new(GuidedLocalSearch::with_params(
-        domain::gls::auto_lambda(&shared_matrix, 0.2),
-        500, // stagnation threshold
-    )));
-
     let dqn_config = DqnConfig {
         learning_rate: 0.001,
         discount: 0.95,
@@ -252,19 +244,11 @@ fn main() {
         evolution_interval: 2000,
     };
 
+    // GLS lambda: auto-tuned from the distance matrix
+    let gls_lambda = domain::gls::auto_lambda(&shared_matrix, 0.2);
+
     for ils_round in 0..ils_iterations {
         println!("\n  ─── ILS Round {}/{} ───", ils_round + 1, ils_iterations);
-
-        // GLS: penalize worst edges before each round
-        if ils_round > 0 {
-            let best_lock = best_overall.1.lock().unwrap();
-            let mut gls_state = gls.lock().unwrap();
-            let penalized = gls_state.penalize_top_k_edges(&best_lock, 3);
-            drop(best_lock);
-            for (edge, utility) in &penalized {
-                println!("    GLS: penalized edge ({}, {}) utility={:.2}", edge.0, edge.1, utility);
-            }
-        }
 
         let mut thread_handles = vec![];
 
@@ -276,7 +260,6 @@ fn main() {
             let best_clone = Arc::clone(&best_overall);
             let ladder_clone = Arc::clone(&ladder);
             let exchange_clone = Arc::clone(&exchange);
-            let gls_clone = Arc::clone(&gls);
 
             let temp = {
                 let lad = ladder_clone.lock().unwrap();
@@ -284,6 +267,7 @@ fn main() {
             };
 
             let dqn_cfg_clone = dqn_config.clone();
+            let gls_lambda_local = gls_lambda;
             thread_handles.push(thread::spawn(move || {
                 // Get starting solution
                 let mut start_sol = if ils_round == 0 {
@@ -346,7 +330,13 @@ fn main() {
                     }
                 }
 
-                // Create neuro-memetic engine with DQN + AST
+                // ═══════════════════════════════════════════════════════════════
+                // v0.8 KEY CHANGE: Create GLS state and pass it INTO the engine
+                // The engine uses augmented energy for acceptance decisions
+                // and penalizes edges inside the loop on stagnation.
+                // ═══════════════════════════════════════════════════════════════
+                let mut gls = GuidedLocalSearch::with_params(gls_lambda_local, 500);
+
                 let engine = McmcEngine::with_neuro_memetic(
                     heuristics_clone.to_vec(),
                     temp,
@@ -370,23 +360,14 @@ fn main() {
                     ast_config,
                 );
 
-                let (mut best_sol, telemetry) = engine.optimize(start_sol, max_iterations);
-
-                // GLS post-processing: apply penalties and re-optimize
-                {
-                    let mut gls_state = gls_clone.lock().unwrap();
-                    if gls_state.should_penalize(telemetry.reheat_count * 3000) {
-                        gls_state.penalize_worst_edge(&best_sol);
-                    }
-
-                    // Use GLS-augmented 2-opt for further improvement
-                    let penalty_cost = gls_state.penalty_cost(&best_sol);
-                    if penalty_cost > 0.0 {
-                        // The solution has penalized edges; try to improve
-                        let two_opt = TwoOptLocalSearch::full_search();
-                        two_opt.apply(&mut best_sol);
-                    }
-                }
+                // Run with GLS-native penalty escape
+                let (best_sol, telemetry) = engine.optimize_with_penalty_escape(
+                    start_sol,
+                    max_iterations,
+                    None,
+                    None,
+                    &mut gls,
+                );
 
                 let final_energy = best_sol.evaluate_global();
 
@@ -423,17 +404,18 @@ fn main() {
                     *lock = best_sol.clone();
                 }
 
-                let gls_state = gls_clone.lock().unwrap();
-                (thread_id, start_energy, final_energy, telemetry.reheat_count, telemetry.dqn_epsilon, telemetry.best_ast_fitness, telemetry.avg_ast_fitness, fragment_count, gls_state.total_penalties, gls_state.num_penalized_edges())
+                (thread_id, start_energy, final_energy, telemetry.reheat_count,
+                 telemetry.dqn_epsilon, telemetry.best_ast_fitness, telemetry.avg_ast_fitness,
+                 fragment_count, telemetry.gls_penalty_updates, telemetry.gls_penalized_edges)
             }));
         }
 
         // Collect results
         for handle in thread_handles {
-            if let Ok((tid, start_e, final_e, reheats, dqn_eps, best_ast, avg_ast, frags, gls_penalties, gls_edges)) = handle.join() {
+            if let Ok((tid, start_e, final_e, reheats, dqn_eps, best_ast, avg_ast, frags, gls_pen, gls_edges)) = handle.join() {
                 let improvement = (start_e - final_e) / start_e * 100.0;
                 println!("    Thread {} | Start: {:.2} | Final: {:.2} | +{:.1}% | Reheats: {} | DQN_ε: {:.3} | AST: {:.2} | Frags: {} | GLS_pen: {} | GLS_edges: {}",
-                    tid, start_e, final_e, improvement, reheats, dqn_eps, best_ast, frags, gls_penalties, gls_edges);
+                    tid, start_e, final_e, improvement, reheats, dqn_eps, best_ast, frags, gls_pen, gls_edges);
             }
         }
 
@@ -464,8 +446,13 @@ fn main() {
 
         // GLS: decay penalties and re-optimize
         {
-            let mut gls_state = gls.lock().unwrap();
-            gls_state.decay_penalties(0.5);
+            let mut gls = GuidedLocalSearch::with_params(gls_lambda, 200);
+            for _ in 0..5 {
+                gls.penalize_worst_edge(&final_sol);
+                let two_opt = TwoOptLocalSearch::full_search();
+                two_opt.apply(&mut final_sol);
+            }
+            gls.decay_penalties(0.5);
             let two_opt = TwoOptLocalSearch::full_search();
             two_opt.apply(&mut final_sol);
         }
@@ -495,10 +482,6 @@ fn main() {
     println!("║  Theoretical:      {:.4}", theoretical_optimum);
     println!("║  Gap from optimal: {:.4}%", gap);
     println!("║  Total improvement: {:.1}% (vs initial)", (pre_energy - final_energy) / pre_energy * 100.0);
-
-    // GLS summary
-    let gls_state = gls.lock().unwrap();
-    println!("║  GLS penalties:    {} edges penalized, {} total increments",
-        gls_state.num_penalized_edges(), gls_state.total_penalties);
+    println!("║  GLS: penalties applied INSIDE engine loop (v0.8 native)");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 }
