@@ -166,11 +166,6 @@ impl DenseLayer {
 // DQN AGENT
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// State vector dimensionality.
-/// Fixed at: temperature, accept_rate, stall_count, energy_gap, progress,
-/// plus per-heuristic performance (up to 9 heuristics) = 5 + 9 = 14
-const STATE_DIM: usize = 14;
-
 /// Hidden layer size.
 const HIDDEN_DIM: usize = 32;
 
@@ -225,6 +220,9 @@ impl Default for DqnConfig {
 /// Takes a state vector describing the current search context and outputs
 /// Q-values for each available heuristic. The heuristic with the highest
 /// Q-value is selected (with epsilon-greedy exploration).
+///
+/// Uses Double DQN for more stable target Q-value estimation and a ring
+/// buffer replay buffer for O(1) insertion.
 #[derive(Clone, Debug)]
 pub struct DqnAgent {
     /// Online network (updated every step)
@@ -235,10 +233,16 @@ pub struct DqnAgent {
     pub config: DqnConfig,
     /// Number of actions (heuristics)
     pub num_actions: usize,
+    /// State vector dimensionality: 5 global features + num_actions per-heuristic
+    pub state_dim: usize,
     /// Current epsilon for exploration
     pub epsilon: f32,
-    /// Replay buffer
+    /// Replay buffer (ring buffer storage)
     pub replay_buffer: Vec<Experience>,
+    /// Next write position in the ring buffer
+    pub replay_head: usize,
+    /// Current number of entries in the ring buffer
+    pub replay_len: usize,
     /// Decision counter
     pub step_count: usize,
     /// Last observed state (for computing experience)
@@ -255,10 +259,11 @@ impl DqnAgent {
 
     /// Create a new DQN agent with custom configuration.
     pub fn with_config(num_heuristics: usize, config: DqnConfig) -> Self {
+        let state_dim = 5 + num_heuristics;
         let online = vec![
-            DenseLayer::new(STATE_DIM, HIDDEN_DIM, true),    // Input → Hidden 1 (ReLU)
-            DenseLayer::new(HIDDEN_DIM, HIDDEN_DIM, true),   // Hidden 1 → Hidden 2 (ReLU)
-            DenseLayer::new(HIDDEN_DIM, num_heuristics, false), // Hidden 2 → Output (linear)
+            DenseLayer::new(state_dim, HIDDEN_DIM, true),       // Input → Hidden 1 (ReLU)
+            DenseLayer::new(HIDDEN_DIM, HIDDEN_DIM, true),      // Hidden 1 → Hidden 2 (ReLU)
+            DenseLayer::new(HIDDEN_DIM, num_heuristics, false),  // Hidden 2 → Output (linear)
         ];
 
         let target = online.clone();
@@ -268,8 +273,11 @@ impl DqnAgent {
             target,
             config: config.clone(),
             num_actions: num_heuristics,
+            state_dim,
             epsilon: config.epsilon_start,
             replay_buffer: Vec::with_capacity(config.replay_capacity),
+            replay_head: 0,
+            replay_len: 0,
             step_count: 0,
             last_state: None,
             last_action: None,
@@ -323,17 +331,22 @@ impl DqnAgent {
         next_state: Vec<f32>,
         done: bool,
     ) {
-        // Store experience
-        if self.replay_buffer.len() >= self.config.replay_capacity {
-            self.replay_buffer.remove(0);
-        }
-        self.replay_buffer.push(Experience {
+        let exp = Experience {
             state,
             action,
             reward,
             next_state,
             done,
-        });
+        };
+
+        // Ring buffer insertion
+        if self.replay_len < self.config.replay_capacity {
+            self.replay_buffer.push(exp);
+        } else {
+            self.replay_buffer[self.replay_head] = exp;
+        }
+        self.replay_head = (self.replay_head + 1) % self.config.replay_capacity;
+        self.replay_len = self.replay_len.min(self.config.replay_capacity);
 
         self.step_count += 1;
 
@@ -342,7 +355,7 @@ impl DqnAgent {
             .max(self.config.epsilon_end);
 
         // Train if we have enough experiences
-        if self.replay_buffer.len() >= self.config.batch_size && self.step_count % 4 == 0 {
+        if self.replay_len >= self.config.batch_size && self.step_count % 4 == 0 {
             self.train_step();
         }
 
@@ -353,32 +366,39 @@ impl DqnAgent {
     }
 
     /// Perform one training step using a random minibatch.
+    /// Uses Double DQN for more stable target Q-value estimation.
     fn train_step(&mut self) {
-        let batch_size = self.config.batch_size.min(self.replay_buffer.len());
+        let batch_size = self.config.batch_size.min(self.replay_len);
         let mut rng = rand::thread_rng();
 
         // Sample random minibatch
         let batch: Vec<usize> = (0..batch_size)
-            .map(|_| rng.gen_range(0..self.replay_buffer.len()))
+            .map(|_| rng.gen_range(0..self.replay_len))
             .collect();
 
         for &idx in &batch {
             let exp = self.replay_buffer[idx].clone();
 
-            // Compute target Q-value: r + γ * max_a' Q_target(s', a')
+            // Compute target Q-value using Double DQN:
+            // Use online network to select the best action,
+            // then use target network to evaluate that action's Q-value.
             let target_q = if exp.done {
                 exp.reward
             } else {
-                let next_q = self.forward_target(&exp.next_state);
-                let max_next_q = next_q.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let online_next_q = self.forward_online(&exp.next_state);
+                let best_action = online_next_q.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i).unwrap_or(0);
+                let target_next_q = self.forward_target(&exp.next_state);
+                let max_next_q = target_next_q[best_action];
                 exp.reward + self.config.discount as f32 * max_next_q
             };
 
             // Compute current Q-values
             let current_q = self.forward_online(&exp.state);
 
-            // Compute TD error for the selected action
-            let td_error = target_q - current_q[exp.action];
+            // Compute TD error for the selected action, with gradient clipping
+            let td_error = (target_q - current_q[exp.action]).clamp(-1.0, 1.0);
 
             // Backpropagate: create output gradient with TD error at the action position
             let mut output_grad = vec![0.0f32; self.num_actions];
@@ -417,7 +437,7 @@ impl DqnAgent {
         progress: f64, // 0.0 to 1.0, fraction of iterations completed
         heuristic_performances: &[f64], // per-heuristic recent performance
     ) -> Vec<f32> {
-        let mut state = Vec::with_capacity(STATE_DIM);
+        let mut state = Vec::with_capacity(self.state_dim);
 
         // Temperature (log-normalized)
         state.push((temperature.ln().max(-20.0) / 10.0) as f32);
@@ -439,8 +459,9 @@ impl DqnAgent {
         // Progress through the search
         state.push(progress as f32);
 
-        // Per-heuristic performance (padded/truncated to 9 slots)
-        for i in 0..9 {
+        // Per-heuristic performance (padded to state_dim - 5 slots)
+        let perf_slots = self.state_dim - 5;
+        for i in 0..perf_slots {
             if i < heuristic_performances.len() {
                 let perf = heuristic_performances[i];
                 // Normalize: tanh to bound the range
@@ -448,12 +469,6 @@ impl DqnAgent {
             } else {
                 state.push(0.0);
             }
-        }
-
-        // Ensure exact state dimension
-        state.truncate(STATE_DIM);
-        while state.len() < STATE_DIM {
-            state.push(0.0);
         }
 
         state

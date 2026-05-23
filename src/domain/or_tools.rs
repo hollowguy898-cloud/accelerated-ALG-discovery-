@@ -78,10 +78,9 @@ impl LowLevelHeuristic<TspSolution> for RelocateNeighborsHeuristic {
 
         // Build the snake: start with one city, extend while cost delta is acceptable
         let mut snake_len = 1usize;
-        let mut cumulative_delta = 0.0f64;
 
         // Compute delta for moving the first node
-        let a = solution.route[(src_start + n - 1) % n]; // node before snake
+        let a = solution.route[(src_start + n - 1) % n]; // node before snake source gap
         let b = solution.route[src_start];                 // first snake node
         let c = solution.route[(src_start + 1) % n];      // node after snake
 
@@ -89,67 +88,29 @@ impl LowLevelHeuristic<TspSolution> for RelocateNeighborsHeuristic {
         let t = solution.route[target];
         let t_next = solution.route[(target + 1) % n];
 
-        // Removal cost: (a-b) + (b-c) -> (a-c)
-        let removal_gain = solution.matrix[a][b] + solution.matrix[b][c] - solution.matrix[a][c];
-
-        // Insertion cost: (t-t_next) -> (t-b) + (b-t_next)
+        // Removal: break (a,b) and (b,c), add gap (a,c)
+        // Insertion: break (t,t_next), add (t,b) and (b,t_next)
+        let removal_saving = solution.matrix[a][b] + solution.matrix[b][c] - solution.matrix[a][c];
         let insertion_cost = solution.matrix[t][b] + solution.matrix[b][t_next] - solution.matrix[t][t_next];
+        let mut cumulative_delta = insertion_cost - removal_saving;
 
-        cumulative_delta = insertion_cost - removal_gain;
-
-        // Try extending the snake
+        // Extend snake: incremental delta per extension
         for extend in 1..self.max_snake_len {
             if src_start + extend >= n { break; }
-
             let next_city = solution.route[(src_start + extend) % n];
             let after_next = solution.route[(src_start + extend + 1) % n];
-
-            // New removal: we're also removing the edge between the current snake end and after_next
-            // But we already removed b-c, now we need c-d -> a-d (where d is after next_city)
             let prev_snake_end = solution.route[(src_start + extend - 1) % n];
 
-            // Actually, extending the snake means:
-            // Previously we removed: (a, b) and (b_end, c) where b_end was the last snake node
-            // Now we remove: (b_end, next) and (next, after_next) -> effectively (b_end, after_next)
-            // But the previous removal already removed (prev_snake_end, c), now c is part of the snake
-            // so we need to update: instead of closing with (a, after_next), we close with (a, after_next)
-            // but we also keep (prev_snake_end, next) inside the snake
-
-            // Simplified delta: adding next_city to the snake means
-            // we no longer need the edge from prev snake end to after_next,
-            // we instead keep the edge from prev snake end to next_city (inside snake),
-            // and the new gap closure is (a, after_next)
-            let _old_gap_close = solution.matrix[a][after_next];
-            let _new_gap_close = solution.matrix[prev_snake_end][next_city];
-
-            // Actually let me simplify this. For each extension:
-            // The gap at the source changes: a -> after_extend
-            // The snake now includes one more city
-            let new_after = solution.route[(src_start + extend + 1) % n];
-
-            // Re-compute: with snake of length extend+1
-            // Source gap: route[src_prev] -> route[src_start + extend + 1]
-            // The snake cities are route[src_start..src_start+extend+1]
-            // Insertion: t -> snake[0] -> ... -> snake[extend] -> t_next
-
-            // Simplified incremental delta for extending by one:
-            // Previously gap closed at: a -> (src_start + extend)
-            // Now gap closes at: a -> (src_start + extend + 1)
-            let old_bridge = solution.matrix[a][solution.route[(src_start + extend) % n]];
-            let new_bridge = solution.matrix[a][new_after];
-
-            // At insertion point, we need to add edge from snake[extend] to t_next
-            // Previously we had: snake[extend-1] -> t_next
-            // Now: snake[extend] -> t_next
-            let old_insert_bridge = solution.matrix[solution.route[(src_start + extend - 1) % n]][t_next];
+            // Source gap: old close a→next_city, new close a→after_next
+            let old_source_bridge = solution.matrix[a][next_city];
+            let new_source_bridge = solution.matrix[a][after_next];
+            // Insertion: old prev_snake_end→t_next, new next_city→t_next
+            let old_insert_bridge = solution.matrix[prev_snake_end][t_next];
             let new_insert_bridge = solution.matrix[next_city][t_next];
 
-            let extend_delta = (new_bridge + new_insert_bridge) - (old_bridge + old_insert_bridge);
-
-            if cumulative_delta + extend_delta > cost_limit {
-                break; // Stop extending: would be too expensive
-            }
-
+            let extend_delta = (new_source_bridge + new_insert_bridge)
+                - (old_source_bridge + old_insert_bridge);
+            if cumulative_delta + extend_delta > cost_limit { break; }
             cumulative_delta += extend_delta;
             snake_len = extend + 1;
         }
@@ -420,7 +381,7 @@ impl SpatialClusterLNS {
 /// drops it into a specific position in the tour. This is the most
 /// fundamental inter-route operator, adapted for single-route TSP.
 ///
-/// Can evaluate delta cost in O(1) by calculating the difference of
+/// O(1) delta evaluation by calculating the difference of
 /// 4 to 6 broken and reconnected edges.
 pub struct RelocateSegmentHeuristic {
     /// Maximum segment length to relocate
@@ -453,7 +414,23 @@ impl LowLevelHeuristic<TspSolution> for RelocateSegmentHeuristic {
             if attempts > 20 { return Some(0.0); }
         }
 
-        let old_energy = solution.evaluate_global();
+        // O(1) delta: compute before modifying
+        let before_src = if src > 0 { solution.route[src - 1] } else { solution.route[n - 1] };
+        let seg_first = solution.route[src];
+        let seg_last = solution.route[src + seg_len - 1];
+        let after_src = solution.route[(src + seg_len) % n];
+        let dst_prev = solution.route[if dst > 0 { dst - 1 } else { n - 1 }];
+        let dst_next = solution.route[dst % n];
+
+        // Removal delta: close gap where segment was
+        let removal_delta = solution.matrix[before_src][after_src]
+            - solution.matrix[before_src][seg_first]
+            - solution.matrix[seg_last][after_src];
+        // Insertion delta: splice segment into new position
+        let insertion_delta = solution.matrix[dst_prev][seg_first]
+            + solution.matrix[seg_last][dst_next]
+            - solution.matrix[dst_prev][dst_next];
+        let delta = removal_delta + insertion_delta;
 
         // Extract segment
         let segment: Vec<usize> = solution.route[src..src + seg_len].to_vec();
@@ -468,8 +445,7 @@ impl LowLevelHeuristic<TspSolution> for RelocateSegmentHeuristic {
 
         solution.route.splice(insert_pos..insert_pos, segment.into_iter());
 
-        let new_energy = solution.evaluate_global();
-        Some(new_energy - old_energy)
+        Some(delta)
     }
 }
 
@@ -568,13 +544,28 @@ impl LowLevelHeuristic<TspSolution> for CrossExchangeHeuristic {
 
         let mut rng = rand::thread_rng();
 
-        // Pick 4 cut points that divide the tour into 4 segments
-        let p1 = rng.gen_range(1..n / 4);
+        // Pick 4 cut points that divide the tour into segments, with panic-safe ranges
+        let p1 = rng.gen_range(1..(n / 4).max(2));
+        if n / 2 <= p1 + 1 { return Some(0.0); }
         let p2 = rng.gen_range(p1 + 1..n / 2);
-        let p3 = rng.gen_range(n / 2..3 * n / 4);
-        let p4 = rng.gen_range(p3 + 1..n - 1);
+        let p3 = rng.gen_range((n / 2).max(p2 + 1)..(3 * n / 4).max(n / 2 + 1));
+        if p3 + 1 >= n - 1 { return Some(0.0); }
+        let p4 = rng.gen_range((p3 + 1).min(n - 2)..n - 1);
 
-        let old_energy = solution.evaluate_global();
+        // O(1) delta: compute before modifying
+        // The new route is: [0..p1] + [p3..p4] + [p2..p3] + [p1..p2] + [p4..]
+        // 4 old boundary edges:
+        let old1 = solution.matrix[solution.route[p1 - 1]][solution.route[p1]];
+        let old2 = solution.matrix[solution.route[p2 - 1]][solution.route[p2]];
+        let old3 = solution.matrix[solution.route[p3 - 1]][solution.route[p3]];
+        let old4 = solution.matrix[solution.route[p4 - 1]][solution.route[p4]];
+        // 4 new boundary edges:
+        let new1 = solution.matrix[solution.route[p1 - 1]][solution.route[p3]];
+        let new2 = solution.matrix[solution.route[p4 - 1]][solution.route[p2]];
+        let new3 = solution.matrix[solution.route[p3 - 1]][solution.route[p1]];
+        let new4 = solution.matrix[solution.route[p2 - 1]][solution.route[p4]];
+
+        let delta = (new1 + new2 + new3 + new4) - (old1 + old2 + old3 + old4);
 
         // Four segments: [0..p1], [p1..p2], [p2..p3], [p3..p4], [p4..]
         // Cross exchange: swap segment [p1..p2] with [p3..p4]
@@ -590,8 +581,7 @@ impl LowLevelHeuristic<TspSolution> for CrossExchangeHeuristic {
 
         solution.route = new_route;
 
-        let new_energy = solution.evaluate_global();
-        Some(new_energy - old_energy)
+        Some(delta)
     }
 }
 

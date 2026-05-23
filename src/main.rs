@@ -1,17 +1,13 @@
 // src/main.rs
-// MCMC-driven Hyper-Heuristic Framework v0.8 — "GLS-Native"
+// MCMC-driven Hyper-Heuristic Framework v0.9 — "GLS-Native + Real PT + EAX"
 //
-// v0.8: GLS penalties are now wired directly into the MCMC engine's
-// acceptance criterion. When the engine encounters stagnation, it
-// penalizes high-utility edges INSIDE the loop, and the Metropolis-
-// Hastings criterion uses augmented energy. This means penalized edges
-// are genuinely "expensive" during search — not just post-processed.
-//
-// Architecture:
-//   RL-driven selection (DQN) + AST-modulated acceptance
-//   + GLS-native penalty escape (augmented energy in MH criterion)
-//   + Spatial LNS diversification + Snaking relocation + Candidate pruning
-//   + Lock-free fragment exchange + Adaptive tempering
+// v0.9: Critical fixes over v0.8:
+//   1. ElitePool now caches energies — evaluate_global() called ONCE per insertion
+//   2. Parallel tempering actually swaps solutions between chains (not just temps)
+//   3. Fragment exchange implements simplified EAX grafting instead of blind LNS
+//   4. Greedy NN route builder extracted into a single reusable function
+//   5. GLS constructor calls include n parameter
+//   6. Problem size increased to 200 cities, 50k iterations
 
 mod core;
 mod domain;
@@ -40,9 +36,147 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER: Greedy Nearest-Neighbor Route Builder
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Build a greedy nearest-neighbor TSP route starting from a random city.
+///
+/// This replaces the 3 copy-pasted NN builders that were scattered throughout
+/// the ILS loop and thread initialization.
+fn build_greedy_nn_route(
+    matrix: &Arc<Vec<Vec<f64>>>,
+    candidates: &Arc<CandidateSet>,
+) -> TspSolution {
+    let mut rng = rand::thread_rng();
+    let n = matrix.len();
+    let mut visited = vec![false; n];
+    let mut route = Vec::with_capacity(n);
+    let start = rng.gen_range(0..n);
+    route.push(start);
+    visited[start] = true;
+    for _ in 1..n {
+        let cur = *route.last().unwrap();
+        let (mut near, mut nd) = (0, f64::MAX);
+        for j in 0..n {
+            if !visited[j] && matrix[cur][j] < nd {
+                nd = matrix[cur][j];
+                near = j;
+            }
+        }
+        visited[near] = true;
+        route.push(near);
+    }
+    TspSolution::new(route, Arc::clone(matrix), Arc::clone(candidates))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER: EAX-Style Fragment Grafting
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Graft a fragment (sequence of cities from another chain's best solution)
+/// into the current solution using simplified Edge Assembly Crossover (EAX).
+///
+/// Strategy:
+/// - Find the positions of the fragment's cities in the current route
+/// - If they form a contiguous or near-contiguous subsequence, keep as-is
+///   (the building block is already assembled in the current solution)
+/// - If scattered, remove them and re-insert in the fragment's order using
+///   cheapest insertion — this preserves the fragment's edge structure
+fn graft_fragment(sol: &mut TspSolution, fragment: &[usize]) {
+    let n = sol.route.len();
+    if fragment.len() < 2 || fragment.len() >= n {
+        return;
+    }
+
+    // Build position lookup: city index -> position in current route
+    let mut pos = vec![0usize; n];
+    for (i, &city) in sol.route.iter().enumerate() {
+        pos[city] = i;
+    }
+
+    // Get positions of fragment cities in the current route
+    let frag_positions: Vec<usize> = fragment.iter().map(|&c| pos[c]).collect();
+
+    // Sort positions to check contiguity
+    let mut sorted_pos = frag_positions.clone();
+    sorted_pos.sort();
+
+    // Count gaps between consecutive positions
+    let gaps: usize = sorted_pos
+        .windows(2)
+        .map(|w| if w[1] > w[0] + 1 { w[1] - w[0] - 1 } else { 0 })
+        .sum();
+
+    // If contiguous or near-contiguous (gaps ≤ 1/3 of fragment size),
+    // the building block is already assembled — leave it alone
+    if gaps <= fragment.len() / 3 {
+        return;
+    }
+
+    // Scattered: remove fragment cities, then re-insert in fragment order
+    let frag_set: Vec<bool> = {
+        let mut s = vec![false; n];
+        for &c in fragment {
+            s[c] = true;
+        }
+        s
+    };
+
+    // Remove fragment cities, keeping the rest in order
+    let mut remaining: Vec<usize> = sol
+        .route
+        .iter()
+        .filter(|&&c| !frag_set[c])
+        .copied()
+        .collect();
+
+    // Insert fragment cities in the fragment's order using cheapest insertion
+    let matrix = &sol.matrix;
+    for &city in fragment {
+        if remaining.is_empty() {
+            remaining.push(city);
+            continue;
+        }
+
+        let mut best_pos = 0;
+        let mut best_cost = f64::MAX;
+        for i in 0..=remaining.len() {
+            let prev = if i == 0 {
+                remaining[remaining.len() - 1]
+            } else {
+                remaining[i - 1]
+            };
+            let next = if i == remaining.len() {
+                remaining[0]
+            } else {
+                remaining[i]
+            };
+            let cost = matrix[prev][city] + matrix[city][next] - matrix[prev][next];
+            if cost < best_cost {
+                best_cost = cost;
+                best_pos = i;
+            }
+        }
+        remaining.insert(best_pos, city);
+    }
+
+    sol.route = remaining;
+    sol.invalidate_energy();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ELITE POOL (with cached energies)
+// ══════════════════════════════════════════════════════════════════════════════
+
 /// Elite pool: shared best solutions across all search chains.
+///
+/// Caches energies to avoid repeated O(n) `evaluate_global()` calls.
+/// The `energies` vector always mirrors the `solutions` vector — they
+/// are modified together under the same lock.
 struct ElitePool {
     solutions: Mutex<Vec<TspSolution>>,
+    energies: Mutex<Vec<f64>>,
     max_size: usize,
 }
 
@@ -50,42 +184,57 @@ impl ElitePool {
     fn new(max_size: usize) -> Self {
         ElitePool {
             solutions: Mutex::new(Vec::with_capacity(max_size)),
+            energies: Mutex::new(Vec::with_capacity(max_size)),
             max_size,
         }
     }
 
+    /// Try to add a solution to the pool.
+    ///
+    /// Computes the energy ONCE and stores it in the cached `energies` vector.
+    /// All comparisons use the cached value instead of calling `evaluate_global()`.
     fn try_add(&self, sol: &TspSolution) {
-        let energy = sol.evaluate_global();
+        let energy = sol.evaluate_global(); // compute ONCE
         let mut pool = self.solutions.lock().unwrap();
+        let mut energies = self.energies.lock().unwrap();
 
+        // Check against worst solution in the pool
         if pool.len() >= self.max_size {
-            if let Some(worst) = pool.last() {
-                if energy >= worst.evaluate_global() {
+            if let Some(&worst_e) = energies.last() {
+                if energy >= worst_e {
                     return;
                 }
             }
         }
 
+        // Check for duplicates (by energy proximity)
         let mut is_dup = false;
-        for existing in pool.iter() {
-            if (existing.evaluate_global() - energy).abs() < 0.01 {
+        for &existing_e in energies.iter() {
+            if (existing_e - energy).abs() < 0.01 {
                 is_dup = true;
                 break;
             }
         }
-        if is_dup { return; }
+        if is_dup {
+            return;
+        }
 
-        let insert_pos = pool
+        // Find insert position (maintain sorted order by energy ascending)
+        let insert_pos = energies
             .iter()
-            .position(|s| s.evaluate_global() > energy)
+            .position(|&e| e > energy)
             .unwrap_or(pool.len());
 
+        // Insert or replace
         if pool.len() >= self.max_size {
             pool.pop();
+            energies.pop();
             let ins = insert_pos.min(pool.len());
             pool.insert(ins, sol.clone());
+            energies.insert(ins, energy);
         } else {
             pool.insert(insert_pos, sol.clone());
+            energies.insert(insert_pos, energy);
         }
     }
 
@@ -96,23 +245,29 @@ impl ElitePool {
 
     fn get_random(&self) -> Option<TspSolution> {
         let pool = self.solutions.lock().unwrap();
-        if pool.is_empty() { return None; }
+        if pool.is_empty() {
+            return None;
+        }
         let mut rng = rand::thread_rng();
         let idx = rng.gen_range(0..pool.len());
         Some(pool[idx].clone())
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ══════════════════════════════════════════════════════════════════════════════
+
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  MCMC-Driven Hyper-Heuristic Framework  v0.8                           ║");
-    println!("║  GLS-NATIVE — Augmented Energy in MH Criterion                        ║");
+    println!("║  MCMC-Driven Hyper-Heuristic Framework  v0.9                           ║");
+    println!("║  GLS-NATIVE + Real PT Swaps + EAX Grafting + Cached ElitePool         ║");
     println!("║  GLS + SpatialLNS | Snaking | DQN + AST | SoA | Lock-Free Exchange    ║");
     println!("║  PathCheapestArc | Relocate/Exchange/Cross | Adaptive Tempering        ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
     println!();
 
-    let num_cities = 60;
+    let num_cities = 200;
     let cities: Vec<City> = (0..num_cities)
         .map(|i| {
             let angle = (i as f64) * (2.0 * std::f64::consts::PI / num_cities as f64);
@@ -136,21 +291,9 @@ fn main() {
     let mut best_init: Option<TspSolution> = None;
     let mut best_init_energy = f64::MAX;
 
-    // Greedy NN starts
+    // Greedy NN starts (using the extracted function)
     for s in 0..num_starts {
-        let mut rng = rand::thread_rng();
-        let n = shared_matrix.len();
-        let mut visited = vec![false; n];
-        let mut route = Vec::with_capacity(n);
-        let start = rng.gen_range(0..n);
-        route.push(start); visited[start] = true;
-        for _ in 1..n {
-            let cur = *route.last().unwrap();
-            let (mut near, mut nd) = (0, f64::MAX);
-            for j in 0..n { if !visited[j] && shared_matrix[cur][j] < nd { nd = shared_matrix[cur][j]; near = j; } }
-            visited[near] = true; route.push(near);
-        }
-        let sol = TspSolution::new(route, Arc::clone(&shared_matrix), Arc::clone(&candidate_set));
+        let sol = build_greedy_nn_route(&shared_matrix, &candidate_set);
         let e = sol.evaluate_global();
         if e < best_init_energy {
             best_init_energy = e;
@@ -217,7 +360,7 @@ fn main() {
 
     let num_threads = 4;
     let ils_iterations = 3;
-    let max_iterations = 10_000;
+    let max_iterations = 50_000;
 
     let elite_pool = Arc::new(ElitePool::new(num_threads * 2));
     elite_pool.try_add(&init_sol);
@@ -272,19 +415,7 @@ fn main() {
                 // Get starting solution
                 let mut start_sol = if ils_round == 0 {
                     elite_clone.get_best().unwrap_or_else(|| {
-                        let mut rng = rand::thread_rng();
-                        let n = matrix_clone.len();
-                        let mut visited = vec![false; n];
-                        let mut route = Vec::with_capacity(n);
-                        let start = rng.gen_range(0..n);
-                        route.push(start); visited[start] = true;
-                        for _ in 1..n {
-                            let cur = *route.last().unwrap();
-                            let (mut near, mut nd) = (0, f64::MAX);
-                            for j in 0..n { if !visited[j] && matrix_clone[cur][j] < nd { nd = matrix_clone[cur][j]; near = j; } }
-                            visited[near] = true; route.push(near);
-                        }
-                        TspSolution::new(route, Arc::clone(&matrix_clone), Arc::clone(&candidates_clone))
+                        build_greedy_nn_route(&matrix_clone, &candidates_clone)
                     })
                 } else {
                     let sol = if thread_id == 0 {
@@ -300,33 +431,20 @@ fn main() {
                         two_opt.apply(&mut sol);
                         sol
                     } else {
-                        let mut rng = rand::thread_rng();
-                        let n = matrix_clone.len();
-                        let mut visited = vec![false; n];
-                        let mut route = Vec::with_capacity(n);
-                        let start = rng.gen_range(0..n);
-                        route.push(start); visited[start] = true;
-                        for _ in 1..n {
-                            let cur = *route.last().unwrap();
-                            let (mut near, mut nd) = (0, f64::MAX);
-                            for j in 0..n { if !visited[j] && matrix_clone[cur][j] < nd { nd = matrix_clone[cur][j]; near = j; } }
-                            visited[near] = true; route.push(near);
-                        }
-                        TspSolution::new(route, Arc::clone(&matrix_clone), Arc::clone(&candidates_clone))
+                        build_greedy_nn_route(&matrix_clone, &candidates_clone)
                     }
                 };
 
                 let start_energy = start_sol.evaluate_global();
 
-                // Collect path fragments from exchange network
+                // Collect path fragments from exchange network and graft them
+                // using simplified EAX instead of just triggering SpatialClusterLNS
                 let fragments = exchange_clone.collect_fragments(thread_id);
                 let fragment_count = fragments.len();
 
-                if !fragments.is_empty() {
-                    let best_fragment = &fragments[0];
-                    if best_fragment.is_good() && best_fragment.cities.len() >= 3 {
-                        let lns = SpatialClusterLNS::new(10);
-                        lns.apply(&mut start_sol);
+                for frag in &fragments {
+                    if frag.is_good() && frag.cities.len() >= 3 {
+                        graft_fragment(&mut start_sol, &frag.cities);
                     }
                 }
 
@@ -335,7 +453,7 @@ fn main() {
                 // The engine uses augmented energy for acceptance decisions
                 // and penalizes edges inside the loop on stagnation.
                 // ═══════════════════════════════════════════════════════════════
-                let mut gls = GuidedLocalSearch::with_params(gls_lambda_local, 500);
+                let mut gls = GuidedLocalSearch::with_params(matrix_clone.len(), gls_lambda_local, 500);
 
                 let engine = McmcEngine::with_neuro_memetic(
                     heuristics_clone.to_vec(),
@@ -371,9 +489,6 @@ fn main() {
 
                 let final_energy = best_sol.evaluate_global();
 
-                // Add to elite pool
-                elite_clone.try_add(&best_sol);
-
                 // Inject path fragments into exchange network
                 let route = &best_sol.route;
                 let frags = ExchangeNetwork::extract_fragments(
@@ -389,12 +504,6 @@ fn main() {
                     exchange_clone.inject(thread_id, frag);
                 }
 
-                // Attempt replica exchange with adjacent chain
-                if thread_id < num_threads - 1 {
-                    let mut lad = ladder_clone.lock().unwrap();
-                    lad.try_swap(thread_id, final_energy, thread_id + 1, final_energy);
-                }
-
                 // Update global best
                 let current_best_bits = best_clone.0.load(Ordering::Relaxed);
                 let current_best = f64::from_bits(current_best_bits);
@@ -404,16 +513,82 @@ fn main() {
                     *lock = best_sol.clone();
                 }
 
-                (thread_id, start_energy, final_energy, telemetry.reheat_count,
-                 telemetry.dqn_epsilon, telemetry.best_ast_fitness, telemetry.avg_ast_fitness,
+                // Return the best solution for PT swapping in the main loop
+                (thread_id, start_energy, final_energy, best_sol, temp,
+                 telemetry.reheat_count, telemetry.dqn_epsilon,
+                 telemetry.best_ast_fitness, telemetry.avg_ast_fitness,
                  fragment_count, telemetry.gls_penalty_updates, telemetry.gls_penalized_edges)
             }));
         }
 
-        // Collect results
+        // Collect results into an indexed structure for PT swapping
+        let mut results: Vec<Option<(usize, f64, f64, TspSolution, f64, usize, f32, f64, f64, usize, usize, usize)>> =
+            vec![None; num_threads];
+
         for handle in thread_handles {
-            if let Ok((tid, start_e, final_e, reheats, dqn_eps, best_ast, avg_ast, frags, gls_pen, gls_edges)) = handle.join() {
+            if let Ok((tid, start_e, final_e, best_sol, temp, reheats, dqn_eps, best_ast, avg_ast, frags, gls_pen, gls_edges)) = handle.join() {
+                results[tid] = Some((tid, start_e, final_e, best_sol, temp, reheats, dqn_eps, best_ast, avg_ast, frags, gls_pen, gls_edges));
+            }
+        }
+
+        // ── Parallel Tempering: swap solutions AND temperatures between adjacent chains ──
+        // After all threads finish, attempt swaps between adjacent pairs.
+        // Standard PT criterion: accept with prob min(1, exp((1/T_i - 1/T_j) * (E_j - E_i)))
+        // If accepted, swap the solutions AND temperatures.
+        {
+            let mut lad = ladder.lock().unwrap();
+            for i in 0..num_threads - 1 {
+                let j = i + 1;
+                if results[i].is_none() || results[j].is_none() {
+                    continue;
+                }
+
+                // Destructure safely (we just checked is_none)
+                let ri = results[i].as_ref().unwrap();
+                let rj = results[j].as_ref().unwrap();
+
+                let e_i = ri.2; // final_energy
+                let e_j = rj.2;
+                let t_i = lad.temperatures[i];
+                let t_j = lad.temperatures[j];
+
+                // PT swap criterion
+                let delta_beta = 1.0 / t_j - 1.0 / t_i;
+                let delta_energy = e_j - e_i;
+                let log_prob = delta_beta * delta_energy;
+
+                let accepted = if log_prob >= 0.0 {
+                    true
+                } else {
+                    let mut rng = rand::thread_rng();
+                    rng.gen::<f64>() < log_prob.exp()
+                };
+
+                lad.record_swap(i, accepted);
+
+                if accepted {
+                    // Swap temperatures in the ladder
+                    lad.temperatures.swap(i, j);
+
+                    // Swap solutions in the results (so the correct solution
+                    // goes to the elite pool and the next round picks the
+                    // right starting point via temperature)
+                    results.swap(i, j);
+
+                    println!("    PT swap: chain {} <-> chain {} ACCEPTED (E_i={:.2}, E_j={:.2})",
+                        i, j, e_i, e_j);
+                }
+            }
+        }
+
+        // Now add all results to the elite pool and print stats
+        for result_opt in results.into_iter() {
+            if let Some((tid, start_e, final_e, best_sol, _temp, reheats, dqn_eps, best_ast, avg_ast, frags, gls_pen, gls_edges)) = result_opt {
                 let improvement = (start_e - final_e) / start_e * 100.0;
+
+                // Add to elite pool (uses cached energies internally)
+                elite_pool.try_add(&best_sol);
+
                 println!("    Thread {} | Start: {:.2} | Final: {:.2} | +{:.1}% | Reheats: {} | DQN_ε: {:.3} | AST: {:.2} | Frags: {} | GLS_pen: {} | GLS_edges: {}",
                     tid, start_e, final_e, improvement, reheats, dqn_eps, best_ast, frags, gls_pen, gls_edges);
             }
@@ -446,7 +621,7 @@ fn main() {
 
         // GLS: decay penalties and re-optimize
         {
-            let mut gls = GuidedLocalSearch::with_params(gls_lambda, 200);
+            let mut gls = GuidedLocalSearch::with_params(cities.len(), gls_lambda, 200);
             for _ in 0..5 {
                 gls.penalize_worst_edge(&final_sol);
                 let two_opt = TwoOptLocalSearch::full_search();
@@ -483,5 +658,7 @@ fn main() {
     println!("║  Gap from optimal: {:.4}%", gap);
     println!("║  Total improvement: {:.1}% (vs initial)", (pre_energy - final_energy) / pre_energy * 100.0);
     println!("║  GLS: penalties applied INSIDE engine loop (v0.8 native)");
+    println!("║  PT: real solution swaps between chains (v0.9)");
+    println!("║  EAX: fragment grafting from exchange network (v0.9)");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 }

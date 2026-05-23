@@ -1,19 +1,21 @@
 // src/core/engine.rs
-// MCMC-driven Hyper-Heuristic Engine v0.8 — "GLS-Native"
+// MCMC-driven Hyper-Heuristic Engine v0.9 — "GLS-Native Deduplicated"
 //
-// v0.8 upgrades over v0.7:
-// - **GLS-native acceptance**: The PenaltyEscape trait is now wired directly
-//   into the core optimization loop. When a penalty escape is active, the
-//   Metropolis-Hastings acceptance criterion uses augmented energy instead
-//   of raw energy. This means penalized edges are genuinely "expensive"
-//   during search — not just post-processed after the fact.
-// - **In-loop penalization**: When stagnation is detected, penalty updates
-//   happen INSIDE the loop (not as post-processing). The search immediately
-//   sees the new penalty landscape and adapts its trajectory.
-// - **Penalty decay**: Periodic decay prevents penalty accumulation, allowing
-//   previously penalized features to become attractive again.
-// - All v0.7 features preserved: DQN, AST, SoA, adaptive cooling,
-//   lock-free exchange, parallel tempering.
+// v0.9 upgrades over v0.8:
+// - **VecDeque accept_window**: Replaced Vec<bool> with VecDeque<bool> for O(1)
+//   pop_front instead of O(n) remove(0) shift.
+// - **Deduplicated loops**: Merged ~95% identical optimize_with_context and
+//   optimize_with_penalty_escape into a single _optimize_inner method with
+//   an optional PenaltyEscape parameter.
+// - **Bidirectional AST modulation**: AST can now both increase and decrease
+//   acceptance probability, with floor 0.1x and ceiling 3x.
+// - **augmented_delta() for efficiency**: Uses PenaltyEscape::augmented_delta()
+//   instead of full O(n) augmented_energy() for candidate evaluation.
+// - **Pre-allocated choice function scores**: Vec::with_capacity(n) avoids
+//   reallocation during heuristic selection.
+//
+// All v0.8 features preserved: GLS-native acceptance, in-loop penalization,
+// penalty decay, DQN, AST, SoA, adaptive cooling, parallel tempering.
 //
 // The engine is completely decoupled from any specific problem domain
 // through the Solution, LowLevelHeuristic, and PenaltyEscape traits.
@@ -23,6 +25,7 @@ use crate::core::rl::{compute_reward, DqnAgent, DqnConfig};
 use crate::core::{LowLevelHeuristic, PenaltyEscape, Solution};
 use crate::infra::Telemetry;
 use rand::Rng;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -105,6 +108,30 @@ struct HeuristicStats {
     time_since_selected: usize,
     times_applied: usize,
     times_accepted: usize,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// NO-OP PENALTY ESCAPE
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// A no-op PenaltyEscape used when no penalty escape is active.
+///
+/// This struct exists solely as a concrete type parameter for
+/// `_optimize_inner` when called without a penalty escape. Its methods
+/// are never actually invoked — the engine short-circuits all penalty
+/// logic when `penalty_escape` is `None`.
+struct NoEscape;
+
+impl<S: Solution> PenaltyEscape<S> for NoEscape {
+    fn augmented_energy(&self, _solution: &S) -> f64 { unreachable!() }
+    fn penalize(&mut self, _solution: &S) -> usize { unreachable!() }
+    fn should_penalize(&self, _iterations_since_improvement: usize) -> bool { false }
+    fn decay_penalties(&mut self, _decay_factor: f64) {}
+    fn reset_penalties(&mut self) {}
+    fn num_penalized(&self) -> usize { 0 }
+    fn total_penalty_count(&self) -> usize { 0 }
+    fn tick(&mut self) {}
+    fn reset_penalty_timer(&mut self) {}
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -199,10 +226,11 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
     fn select_choice_function(&self, stats: &[HeuristicStats], rng: &mut impl Rng) -> usize {
         let n = self.heuristics.len();
         if n == 1 { return 0; }
-        let mut scores: Vec<f64> = stats.iter().map(|s| {
+        let mut scores: Vec<f64> = Vec::with_capacity(n);
+        scores.extend(stats.iter().map(|s| {
             self.choice_config.alpha * s.performance
                 + self.choice_config.beta * (s.time_since_selected as f64).ln_1p()
-        }).collect();
+        }));
         let min_score = scores.iter().cloned().fold(f64::MAX, f64::min);
         if min_score < 0.0 { for s in &mut scores { *s -= min_score; } }
         let epsilon = 0.1;
@@ -229,7 +257,7 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
         agent.select_action(&state).min(self.heuristics.len() - 1)
     }
 
-    // ── Shared helpers for both loops ──
+    // ── Shared helpers ──
 
     fn init_dqn(&self) -> DqnAgent {
         match &self.dqn_config {
@@ -252,186 +280,28 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
         }).collect()
     }
 
-    // ── Legacy Optimization (reheat only) ──
+    // ── Public API ──
 
+    /// Legacy optimization (reheat only, no penalty escape).
     pub fn optimize(&self, initial_solution: S, max_iterations: usize) -> (S, Telemetry) {
         self.optimize_with_context(initial_solution, max_iterations, None, None)
     }
 
+    /// Optimization with optional external DQN agent and AST population (no penalty escape).
     pub fn optimize_with_context(
         &self, initial_solution: S, max_iterations: usize,
         external_agent: Option<DqnAgent>, external_ast_pop: Option<AstPopulation>,
     ) -> (S, Telemetry) {
-        let mut rng = rand::thread_rng();
-        let mut current_sol = initial_solution;
-        let mut current_energy = current_sol.evaluate_global();
-        let mut best_sol = current_sol.clone();
-        let mut best_energy = current_energy;
-        let mut t = self.initial_temp;
-        let mut effective_cooling_rate = self.cooling_rate;
-        let mut telemetry = Telemetry::new(max_iterations, current_energy);
-        let mut iterations_since_improvement = 0usize;
-        let mut reheats_remaining = self.reheat_config.max_reheats;
-        let mut stats = self.init_stats();
-        let mut accept_window: Vec<bool> = Vec::with_capacity(self.adaptive_cooling.window_size);
-        let mut recent_accept_rate = 0.5f64;
-        let mut dqn_agent = external_agent.unwrap_or_else(|| self.init_dqn());
-        let mut ast_pop = external_ast_pop.unwrap_or_else(|| self.init_ast());
-        let mut active_ast_idx = ast_pop.best_idx();
-
-        for iteration in 0..max_iterations {
-            if t < self.min_temp { break; }
-            let progress = iteration as f64 / max_iterations as f64;
-
-            let idx = match self.selection_mode {
-                SelectionMode::ChoiceFunction => self.select_choice_function(&stats, &mut rng),
-                SelectionMode::DqnOnly | SelectionMode::DqnWithAst => self.select_dqn(
-                    &mut dqn_agent, &stats, t, recent_accept_rate,
-                    iterations_since_improvement, current_energy, best_energy, progress,
-                ),
-            };
-            let heuristic = &self.heuristics[idx];
-            for (i, s) in stats.iter_mut().enumerate() {
-                s.time_since_selected = if i == idx { 0 } else { s.time_since_selected + 1 };
-            }
-            stats[idx].times_applied += 1;
-
-            let mut candidate_sol = current_sol.clone();
-            let delta = heuristic.apply(&mut candidate_sol);
-            let candidate_energy = match delta { Some(d) => current_energy + d, None => candidate_sol.evaluate_global() };
-            let delta_e = candidate_energy - current_energy;
-
-            let accepted = if delta_e <= 0.0 {
-                true
-            } else {
-                let base_prob = (-delta_e / t).exp().min(1.0);
-                if self.selection_mode == SelectionMode::DqnWithAst {
-                    let ast_tree = &ast_pop.trees[active_ast_idx];
-                    let energy_scale = best_energy.max(1.0);
-                    let mut ast_ctx = MemoryContext::from_state(
-                        delta_e, idx, self.heuristics.len(), t,
-                        iterations_since_improvement, current_energy, best_energy,
-                        recent_accept_rate, idx, self.heuristics.len(), energy_scale,
-                    );
-                    let ast_score = ast_tree.evaluate(&mut ast_ctx);
-                    let modulation = (1.0 + ast_score.max(0.0) as f64).min(3.0);
-                    let modulated_prob = (base_prob * modulation).min(1.0);
-                    ast_pop.record_outcome(active_ast_idx, delta_e, delta_e <= 0.0);
-                    modulated_prob > 0.0 && rng.gen_bool(modulated_prob)
-                } else {
-                    rng.gen_bool(base_prob)
-                }
-            };
-
-            if accepted {
-                current_sol = candidate_sol;
-                current_energy = candidate_energy;
-                telemetry.record_acceptance(heuristic.name());
-                stats[idx].times_accepted += 1;
-                if delta_e <= 0.0 {
-                    stats[idx].performance = self.choice_config.decay * stats[idx].performance
-                        + (1.0 - self.choice_config.decay) * (-delta_e);
-                } else {
-                    stats[idx].performance = self.choice_config.decay * stats[idx].performance
-                        + (1.0 - self.choice_config.decay) * (-delta_e * 0.1);
-                }
-                if current_energy < best_energy {
-                    best_sol = current_sol.clone();
-                    best_energy = current_energy;
-                    iterations_since_improvement = 0;
-                } else {
-                    iterations_since_improvement += 1;
-                }
-                if self.chain_depth > 0 && delta_e <= 0.0 {
-                    for _ in 0..self.chain_depth {
-                        let mut chain_sol = current_sol.clone();
-                        let chain_delta = heuristic.apply(&mut chain_sol);
-                        let chain_energy = match chain_delta { Some(d) => current_energy + d, None => chain_sol.evaluate_global() };
-                        let chain_de = chain_energy - current_energy;
-                        if chain_de <= 0.0 {
-                            current_sol = chain_sol; current_energy = chain_energy;
-                            stats[idx].times_accepted += 1;
-                            stats[idx].performance = self.choice_config.decay * stats[idx].performance
-                                + (1.0 - self.choice_config.decay) * (-chain_de);
-                            if current_energy < best_energy {
-                                best_sol = current_sol.clone(); best_energy = current_energy;
-                                iterations_since_improvement = 0;
-                            }
-                        } else { break; }
-                    }
-                }
-            } else {
-                stats[idx].performance *= self.choice_config.decay;
-                iterations_since_improvement += 1;
-            }
-
-            if self.selection_mode == SelectionMode::DqnOnly || self.selection_mode == SelectionMode::DqnWithAst {
-                let performances: Vec<f64> = stats.iter().map(|s| s.performance).collect();
-                let state = dqn_agent.build_state(
-                    t, recent_accept_rate, iterations_since_improvement,
-                    current_energy, best_energy, progress, &performances,
-                );
-                let reward = compute_reward(delta_e, accepted, iterations_since_improvement, 1.0);
-                let next_state = dqn_agent.build_state(
-                    t * effective_cooling_rate, recent_accept_rate,
-                    iterations_since_improvement + 1, current_energy, best_energy,
-                    (iteration + 1) as f64 / max_iterations as f64, &performances,
-                );
-                dqn_agent.record_and_train(state, idx, reward, next_state, false);
-            }
-
-            if self.selection_mode == SelectionMode::DqnWithAst {
-                if let Some(ast_cfg) = &self.ast_config {
-                    if iteration > 0 && iteration % ast_cfg.evolution_interval == 0 {
-                        ast_pop.evolve(); active_ast_idx = ast_pop.best_idx();
-                    }
-                }
-            }
-
-            if self.use_adaptive_cooling {
-                accept_window.push(accepted);
-                if accept_window.len() > self.adaptive_cooling.window_size { accept_window.remove(0); }
-                if !accept_window.is_empty() {
-                    recent_accept_rate = accept_window.iter().filter(|&&x| x).count() as f64 / accept_window.len() as f64;
-                }
-                if accept_window.len() >= 100 && iteration % 100 == 0 {
-                    let rate_diff = recent_accept_rate - self.adaptive_cooling.target_acceptance_rate;
-                    let adjustment = 1.0 - self.adaptive_cooling.adaptation_speed * rate_diff;
-                    effective_cooling_rate = (effective_cooling_rate * adjustment).clamp(
-                        self.adaptive_cooling.cooling_rate_floor, self.adaptive_cooling.cooling_rate_ceiling,
-                    );
-                }
-            }
-
-            telemetry.update_history(iteration, current_energy, best_energy);
-            if self.use_adaptive_cooling { t *= effective_cooling_rate; } else { t *= self.cooling_rate; }
-
-            // Legacy reheat escape
-            if self.reheat_config.stagnation_limit > 0
-                && iterations_since_improvement >= self.reheat_config.stagnation_limit
-                && reheats_remaining > 0
-            {
-                current_sol = best_sol.clone();
-                current_energy = best_energy;
-                t = self.initial_temp * self.reheat_config.reheat_fraction;
-                iterations_since_improvement = 0;
-                reheats_remaining -= 1;
-                telemetry.record_reheat();
-                for s in &mut stats { s.performance *= 0.5; }
-            }
-        }
-
-        telemetry.dqn_epsilon = dqn_agent.epsilon;
-        telemetry.best_ast_fitness = ast_pop.best().fitness;
-        telemetry.avg_ast_fitness = ast_pop.avg_fitness();
-        (best_sol, telemetry)
+        self._optimize_inner::<NoEscape>(
+            initial_solution, max_iterations,
+            external_agent, external_ast_pop,
+            None,
+        )
     }
 
-    // ── GLS-Native Optimization (augmented energy in MH criterion) ──
-
-    /// Runs the optimization loop with a PenaltyEscape policy (GLS-native).
+    /// GLS-Native optimization with a PenaltyEscape policy (augmented energy in MH criterion).
     ///
-    /// This is the v0.8 flagship method. When a penalty escape is provided:
+    /// This is the v0.8/v0.9 flagship method. When a penalty escape is provided:
     /// - The Metropolis-Hastings acceptance criterion uses **augmented energy**
     ///   instead of raw energy. Penalized edges are genuinely "expensive" during
     ///   search — the engine will avoid them in its acceptance decisions.
@@ -449,11 +319,44 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
         external_ast_pop: Option<AstPopulation>,
         penalty_escape: &mut P,
     ) -> (S, Telemetry) {
+        self._optimize_inner(
+            initial_solution, max_iterations,
+            external_agent, external_ast_pop,
+            Some(penalty_escape),
+        )
+    }
+
+    // ── Unified inner optimization loop ──
+
+    /// The single deduplicated optimization loop.
+    ///
+    /// When `penalty_escape` is `Some(&mut P)`:
+    ///   - Acceptance uses augmented energy (via `augmented_delta()` when available)
+    ///   - `tick()` is called each iteration
+    ///   - `should_penalize()` / `penalize()` on stagnation
+    ///   - `decay_penalties()` periodically
+    ///
+    /// When `penalty_escape` is `None`:
+    ///   - Acceptance uses raw energy (delta_e = candidate - current)
+    ///   - Reheat escape on stagnation
+    fn _optimize_inner<P: PenaltyEscape<S>>(
+        &self,
+        initial_solution: S,
+        max_iterations: usize,
+        external_agent: Option<DqnAgent>,
+        external_ast_pop: Option<AstPopulation>,
+        mut penalty_escape: Option<&mut P>,
+    ) -> (S, Telemetry) {
         let mut rng = rand::thread_rng();
         let mut current_sol = initial_solution;
         let mut current_real_energy = current_sol.evaluate_global();
-        // Augmented energy: what the MH criterion actually sees
-        let mut current_aug_energy = penalty_escape.augmented_energy(&current_sol);
+
+        // Augmented energy: when no penalty escape is active, this equals real energy
+        let mut current_aug_energy = if let Some(pe) = &mut penalty_escape {
+            pe.augmented_energy(&current_sol)
+        } else {
+            current_real_energy
+        };
 
         let mut best_sol = current_sol.clone();
         let mut best_energy = current_real_energy;
@@ -463,17 +366,21 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
         let mut telemetry = Telemetry::new(max_iterations, current_real_energy);
 
         let mut iterations_since_improvement = 0usize;
+        let mut reheats_remaining = self.reheat_config.max_reheats;
         let mut stats = self.init_stats();
-        let mut accept_window: Vec<bool> = Vec::with_capacity(self.adaptive_cooling.window_size);
+        let mut accept_window: VecDeque<bool> = VecDeque::with_capacity(self.adaptive_cooling.window_size);
         let mut recent_accept_rate = 0.5f64;
         let mut dqn_agent = external_agent.unwrap_or_else(|| self.init_dqn());
         let mut ast_pop = external_ast_pop.unwrap_or_else(|| self.init_ast());
         let mut active_ast_idx = ast_pop.best_idx();
 
+        let has_penalty = penalty_escape.is_some();
+
         for iteration in 0..max_iterations {
             if t < self.min_temp { break; }
             let progress = iteration as f64 / max_iterations as f64;
 
+            // ── Heuristic Selection ──
             let idx = match self.selection_mode {
                 SelectionMode::ChoiceFunction => self.select_choice_function(&stats, &mut rng),
                 SelectionMode::DqnOnly | SelectionMode::DqnWithAst => self.select_dqn(
@@ -487,18 +394,26 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
             }
             stats[idx].times_applied += 1;
 
-            // Apply heuristic
+            // ── Apply Heuristic ──
             let mut candidate_sol = current_sol.clone();
             let delta = heuristic.apply(&mut candidate_sol);
             let candidate_real_energy = match delta {
                 Some(d) => current_real_energy + d,
                 None => candidate_sol.evaluate_global(),
             };
-            let candidate_aug_energy = penalty_escape.augmented_energy(&candidate_sol);
+            let delta_real = candidate_real_energy - current_real_energy;
 
-            // Acceptance decision uses AUGMENTED energy
-            let delta_aug = candidate_aug_energy - current_aug_energy;
+            // ── Compute Augmented Energy Delta ──
+            // Uses augmented_delta() when available (O(1) for 2-opt, O(n) default fallback)
+            // instead of full augmented_energy() which always requires evaluate_global().
+            let (delta_aug, candidate_aug_energy) = if let Some(pe) = &mut penalty_escape {
+                let da = pe.augmented_delta(&current_sol, &candidate_sol, delta_real);
+                (da, current_aug_energy + da)
+            } else {
+                (delta_real, candidate_real_energy)
+            };
 
+            // ── Acceptance Decision (uses augmented delta) ──
             let accepted = if delta_aug <= 0.0 {
                 true
             } else {
@@ -512,7 +427,9 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                         recent_accept_rate, idx, self.heuristics.len(), energy_scale,
                     );
                     let ast_score = ast_tree.evaluate(&mut ast_ctx);
-                    let modulation = (1.0 + ast_score.max(0.0) as f64).min(3.0);
+                    // Bidirectional modulation: AST can both increase and decrease
+                    // acceptance probability. Floor 0.1x, ceiling 3x.
+                    let modulation = (1.0 + (ast_score as f64).clamp(-0.5, 2.0)).max(0.1);
                     let modulated_prob = (base_prob * modulation).min(1.0);
                     ast_pop.record_outcome(active_ast_idx, delta_aug, delta_aug <= 0.0);
                     modulated_prob > 0.0 && rng.gen_bool(modulated_prob)
@@ -521,6 +438,7 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                 }
             };
 
+            // ── Update State ──
             if accepted {
                 current_sol = candidate_sol;
                 current_real_energy = candidate_real_energy;
@@ -545,7 +463,7 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                     iterations_since_improvement += 1;
                 }
 
-                // Deep chain
+                // Deep chain: continue applying the same heuristic while improving
                 if self.chain_depth > 0 && delta_aug <= 0.0 {
                     for _ in 0..self.chain_depth {
                         let mut chain_sol = current_sol.clone();
@@ -554,15 +472,22 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                             Some(d) => current_real_energy + d,
                             None => chain_sol.evaluate_global(),
                         };
-                        let chain_aug = penalty_escape.augmented_energy(&chain_sol);
-                        let chain_delta_aug = chain_aug - current_aug_energy;
-                        if chain_delta_aug <= 0.0 {
+                        let chain_delta_real = chain_real - current_real_energy;
+
+                        let (chain_da, chain_aug) = if let Some(pe) = &mut penalty_escape {
+                            let da = pe.augmented_delta(&current_sol, &chain_sol, chain_delta_real);
+                            (da, current_aug_energy + da)
+                        } else {
+                            (chain_delta_real, chain_real)
+                        };
+
+                        if chain_da <= 0.0 {
                             current_sol = chain_sol;
                             current_real_energy = chain_real;
                             current_aug_energy = chain_aug;
                             stats[idx].times_accepted += 1;
                             stats[idx].performance = self.choice_config.decay * stats[idx].performance
-                                + (1.0 - self.choice_config.decay) * (-chain_delta_aug);
+                                + (1.0 - self.choice_config.decay) * (-chain_da);
                             if current_real_energy < best_energy {
                                 best_sol = current_sol.clone(); best_energy = current_real_energy;
                                 iterations_since_improvement = 0;
@@ -575,15 +500,22 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                 iterations_since_improvement += 1;
             }
 
-            // DQN training (reward based on real energy delta)
+            // ── DQN Training ──
             if self.selection_mode == SelectionMode::DqnOnly || self.selection_mode == SelectionMode::DqnWithAst {
                 let performances: Vec<f64> = stats.iter().map(|s| s.performance).collect();
                 let state = dqn_agent.build_state(
                     t, recent_accept_rate, iterations_since_improvement,
                     current_real_energy, best_energy, progress, &performances,
                 );
-                let real_delta = match delta { Some(d) => d, None => 0.0 };
-                let reward = compute_reward(real_delta, accepted, iterations_since_improvement, 1.0);
+                // When penalty escape is active, use the raw heuristic delta (or 0)
+                // for the reward signal, matching the original penalty-path behavior.
+                // When no penalty escape, use the full computed delta_real.
+                let reward_delta = if has_penalty {
+                    match delta { Some(d) => d, None => 0.0 }
+                } else {
+                    delta_real
+                };
+                let reward = compute_reward(reward_delta, accepted, iterations_since_improvement, 1.0);
                 let next_state = dqn_agent.build_state(
                     t * effective_cooling_rate, recent_accept_rate,
                     iterations_since_improvement + 1, current_real_energy, best_energy,
@@ -592,6 +524,7 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                 dqn_agent.record_and_train(state, idx, reward, next_state, false);
             }
 
+            // ── AST Evolution ──
             if self.selection_mode == SelectionMode::DqnWithAst {
                 if let Some(ast_cfg) = &self.ast_config {
                     if iteration > 0 && iteration % ast_cfg.evolution_interval == 0 {
@@ -600,9 +533,10 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                 }
             }
 
+            // ── Adaptive Cooling (VecDeque for O(1) pop_front) ──
             if self.use_adaptive_cooling {
-                accept_window.push(accepted);
-                if accept_window.len() > self.adaptive_cooling.window_size { accept_window.remove(0); }
+                accept_window.push_back(accepted);
+                if accept_window.len() > self.adaptive_cooling.window_size { accept_window.pop_front(); }
                 if !accept_window.is_empty() {
                     recent_accept_rate = accept_window.iter().filter(|&&x| x).count() as f64 / accept_window.len() as f64;
                 }
@@ -619,36 +553,56 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
             if self.use_adaptive_cooling { t *= effective_cooling_rate; } else { t *= self.cooling_rate; }
 
             // ═══════════════════════════════════════════════════════════════════
-            // GLS-NATIVE ESCAPE — penalties applied INSIDE the loop
+            // ESCAPE MECHANISM — penalty or reheat, never both
             // ═══════════════════════════════════════════════════════════════════
-            penalty_escape.tick();
+            if let Some(pe) = &mut penalty_escape {
+                // ── GLS-Native Escape — penalties applied INSIDE the loop ──
+                pe.tick();
 
-            if penalty_escape.should_penalize(iterations_since_improvement) {
-                let count = penalty_escape.penalize(&current_sol);
-                penalty_escape.reset_penalty_timer();
+                if pe.should_penalize(iterations_since_improvement) {
+                    let count = pe.penalize(&current_sol);
+                    pe.reset_penalty_timer();
 
-                // Recompute augmented energy after penalty landscape changes
-                current_aug_energy = penalty_escape.augmented_energy(&current_sol);
+                    // Recompute augmented energy after penalty landscape changes
+                    current_aug_energy = pe.augmented_energy(&current_sol);
 
-                // Small temperature boost (not a full reheat — just enough to
-                // explore the new penalty landscape)
-                t = (t * 1.5).min(self.initial_temp * 0.3);
-                iterations_since_improvement = 0;
+                    // Small temperature boost (not a full reheat — just enough to
+                    // explore the new penalty landscape)
+                    t = (t * 1.5).min(self.initial_temp * 0.3);
+                    iterations_since_improvement = 0;
 
-                telemetry.gls_penalty_updates += count;
-            }
+                    telemetry.gls_penalty_updates += count;
+                }
 
-            // Periodic penalty decay (every 5000 iterations)
-            if iteration > 0 && iteration % 5000 == 0 {
-                penalty_escape.decay_penalties(0.9);
-                current_aug_energy = penalty_escape.augmented_energy(&current_sol);
+                // Periodic penalty decay (every 5000 iterations)
+                if iteration > 0 && iteration % 5000 == 0 {
+                    pe.decay_penalties(0.9);
+                    current_aug_energy = pe.augmented_energy(&current_sol);
+                }
+            } else {
+                // ── Legacy Reheat Escape ──
+                if self.reheat_config.stagnation_limit > 0
+                    && iterations_since_improvement >= self.reheat_config.stagnation_limit
+                    && reheats_remaining > 0
+                {
+                    current_sol = best_sol.clone();
+                    current_real_energy = best_energy;
+                    current_aug_energy = best_energy; // No penalty, so aug == real
+                    t = self.initial_temp * self.reheat_config.reheat_fraction;
+                    iterations_since_improvement = 0;
+                    reheats_remaining -= 1;
+                    telemetry.record_reheat();
+                    for s in &mut stats { s.performance *= 0.5; }
+                }
             }
         }
 
         telemetry.dqn_epsilon = dqn_agent.epsilon;
         telemetry.best_ast_fitness = ast_pop.best().fitness;
         telemetry.avg_ast_fitness = ast_pop.avg_fitness();
-        telemetry.gls_penalized_edges = penalty_escape.num_penalized();
+        if let Some(pe) = &penalty_escape {
+            telemetry.gls_penalized_edges = pe.num_penalized();
+        }
         (best_sol, telemetry)
     }
 

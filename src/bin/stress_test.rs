@@ -204,7 +204,7 @@ fn main() {
         // v0.8: GLS is passed INTO the engine, not post-processed
         let heuristics = make_heuristics_14();
         let lambda = auto_lambda(&matrix, 0.2);
-        let mut gls = GuidedLocalSearch::with_params(lambda, 200);
+        let mut gls = GuidedLocalSearch::with_params(n, lambda, 200);
 
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
         let engine = McmcEngine::with_neuro_memetic(
@@ -311,7 +311,7 @@ fn main() {
         // v0.8: GLS is wired into the engine natively
         let heuristics = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
-        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 300);
+        let mut gls = GuidedLocalSearch::with_params(n, auto_lambda(&matrix, 0.2), 300);
         let iters = (n * 200).max(20_000);
         let start = Instant::now();
         let engine = McmcEngine::with_neuro_memetic(
@@ -352,7 +352,7 @@ fn main() {
 
         let heuristics = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
-        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 300);
+        let mut gls = GuidedLocalSearch::with_params(cities.len(), auto_lambda(&matrix, 0.2), 300);
         let engine = McmcEngine::with_neuro_memetic(
             heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
         );
@@ -377,7 +377,7 @@ fn main() {
         let candidates = Arc::new(CandidateSet::build(&matrix, 20));
         let sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
 
-        let mut gls = GuidedLocalSearch::new(0.1);
+        let mut gls = GuidedLocalSearch::new(100, 0.1);
 
         // Test edge key canonicalization
         assert_eq!(GuidedLocalSearch::edge_key(3, 7), (3, 7));
@@ -616,7 +616,7 @@ fn main() {
 
         let h = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
-        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 200);
+        let mut gls = GuidedLocalSearch::with_params(n, auto_lambda(&matrix, 0.2), 200);
         let engine = McmcEngine::with_neuro_memetic(
             h, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
         );

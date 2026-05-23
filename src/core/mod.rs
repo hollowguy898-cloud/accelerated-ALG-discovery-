@@ -110,4 +110,20 @@ pub trait PenaltyEscape<S: Solution>: Send + Sync {
     /// Called by the engine after `penalize()` to reset the "time since
     /// last penalty" counter.
     fn reset_penalty_timer(&mut self);
+
+    /// Compute the augmented energy delta between two solutions.
+    ///
+    /// Given the real energy delta (`delta_real = E_real(candidate) - E_real(current)`),
+    /// compute the augmented delta: `E_augmented(candidate) - E_augmented(current)`.
+    ///
+    /// The default implementation falls back to the full augmented energy
+    /// difference, but domain-specific implementations can override this
+    /// for O(1) computation when the changed features are known (e.g.,
+    /// only 4 edges change in a 2-opt move).
+    ///
+    /// For GLS: `delta_aug = delta_real + λ × (penalty_cost(candidate) - penalty_cost(current))`
+    fn augmented_delta(&self, current: &S, candidate: &S, delta_real: f64) -> f64 {
+        let _ = delta_real;
+        self.augmented_energy(candidate) - self.augmented_energy(current)
+    }
 }
