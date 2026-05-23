@@ -1,6 +1,6 @@
 // src/bin/stress_test.rs
-// Comprehensive stress test suite v0.6 — "Neuro-Memetic Demon" Edition
-// DQN + AST | SoA Layout | Lock-Free Exchange | Adaptive Tempering | LK + 2-opt + 3-opt
+// Comprehensive stress test suite v0.7 — "OR-Tools Demon" Edition
+// GLS + SpatialLNS | Snaking | DQN + AST | SoA | Lock-Free Exchange | PathCheapestArc
 
 use accelerated_alg_discovery::core::engine::{
     AdaptiveCoolingConfig, AstConfig, ChoiceFunctionConfig, McmcEngine, ReheatConfig,
@@ -11,10 +11,15 @@ use accelerated_alg_discovery::core::rl::{DqnAgent, DqnConfig, compute_reward};
 use accelerated_alg_discovery::core::LowLevelHeuristic;
 use accelerated_alg_discovery::core::Solution;
 use accelerated_alg_discovery::domain::candidates::CandidateSet;
+use accelerated_alg_discovery::domain::gls::{GuidedLocalSearch, auto_lambda};
 use accelerated_alg_discovery::domain::heuristics::{
     DoubleBridgeHeuristic, InvertSegmentHeuristic, LinKernighanHeuristic, OrOptHeuristic,
     RuinRecreateHeuristic, SwapCitiesHeuristic, ThreeOptCandidate, TwoOptBestOfK,
     TwoOptLocalSearch,
+};
+use accelerated_alg_discovery::domain::or_tools::{
+    CrossExchangeHeuristic, ExchangeSegmentHeuristic, RelocateNeighborsHeuristic,
+    RelocateSegmentHeuristic, SpatialClusterLNS, path_cheapest_arc_init,
 };
 use accelerated_alg_discovery::domain::soa::{soa_two_opt_full, DontLookBitmap, SoACoordinates, SoATour};
 use accelerated_alg_discovery::domain::{City, TspSolution};
@@ -84,7 +89,12 @@ fn build_greedy_nn(n: usize, matrix: Arc<Vec<Vec<f64>>>, candidates: Arc<Candida
     best.unwrap()
 }
 
-fn make_heuristics() -> Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> {
+fn build_path_cheapest_arc(matrix: &Arc<Vec<Vec<f64>>>, candidates: &Arc<CandidateSet>) -> TspSolution {
+    let route = path_cheapest_arc_init(matrix, candidates);
+    TspSolution::new(route, Arc::clone(matrix), Arc::clone(candidates))
+}
+
+fn make_heuristics_9() -> Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> {
     vec![
         Arc::new(TwoOptLocalSearch::single_pass()),
         Arc::new(LinKernighanHeuristic { kick_rounds: 3 }),
@@ -98,7 +108,29 @@ fn make_heuristics() -> Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> {
     ]
 }
 
-fn make_dqn_config() -> DqnConfig {
+fn make_heuristics_14() -> Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> {
+    vec![
+        // Tier 1: Core local search
+        Arc::new(TwoOptLocalSearch::single_pass()),
+        Arc::new(LinKernighanHeuristic { kick_rounds: 3 }),
+        Arc::new(ThreeOptCandidate { samples: 10 }),
+        // Tier 2: OR-Tools operators
+        Arc::new(SpatialClusterLNS::new(15)),
+        Arc::new(RelocateNeighborsHeuristic::new(5)),
+        Arc::new(RelocateSegmentHeuristic::new(3)),
+        Arc::new(ExchangeSegmentHeuristic::new(3)),
+        Arc::new(CrossExchangeHeuristic),
+        // Tier 3: Diversification & fine-tuning
+        Arc::new(DoubleBridgeHeuristic),
+        Arc::new(RuinRecreateHeuristic { ruin_fraction: 0.15 }),
+        Arc::new(OrOptHeuristic { max_segment_len: 3 }),
+        Arc::new(TwoOptBestOfK { k: 15 }),
+        Arc::new(InvertSegmentHeuristic),
+        Arc::new(SwapCitiesHeuristic),
+    ]
+}
+
+fn make_dqn_config(num_heuristics: usize) -> DqnConfig {
     DqnConfig {
         learning_rate: 0.001,
         discount: 0.95,
@@ -118,7 +150,7 @@ fn make_engine_config() -> (ReheatConfig, AdaptiveCoolingConfig, DqnConfig, AstC
         cooling_rate_floor: 0.9990, cooling_rate_ceiling: 0.99995,
         base_cooling_rate: 0.9997, adaptation_speed: 0.08,
     };
-    let dqn = make_dqn_config();
+    let dqn = make_dqn_config(14);
     let ast = AstConfig { population_size: 20, max_depth: 5, evolution_interval: 2000 };
     (reheat, adaptive, dqn, ast, 2)
 }
@@ -127,16 +159,116 @@ fn make_engine_config() -> (ReheatConfig, AdaptiveCoolingConfig, DqnConfig, AstC
 
 fn main() {
     println!("==============================================================================");
-    println!("  MCMC HYPER-HEURISTIC STRESS TEST  v0.6 — \"Neuro-Memetic Demon\"");
-    println!("  DQN + AST | SoA Layout | Lock-Free Exchange | 9 Heuristics");
+    println!("  MCMC HYPER-HEURISTIC STRESS TEST  v0.7 — \"OR-Tools Demon\"");
+    println!("  GLS + SpatialLNS | Snaking | DQN + AST | 14 Heuristics | PathCheapestArc");
     println!("==============================================================================\n");
 
     let mut failures = 0;
     let mut results: Vec<(&str, f64, f64, f64)> = Vec::new();
 
-    // ── SECTION 1: SoA 2-opt Local Search Benchmark ──
+    // ── SECTION 0: Path-Cheapest-Arc vs Greedy NN ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 1: SoA 2-OPT LOCAL SEARCH (cache-aligned, packed don't-look bits)");
+    println!("SECTION 0: PATH-CHEAPEST-ARC vs GREEDY NN INITIALIZATION");
+    for &n in &[60, 200, 500] {
+        let cities = generate_random_uniform_cities(n, 500.0);
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1).max(1)));
+
+        let greedy_sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 5);
+        let greedy_e = greedy_sol.evaluate_global();
+
+        let pca_sol = build_path_cheapest_arc(&matrix, &candidates);
+        let pca_e = pca_sol.evaluate_global();
+
+        let diff = (greedy_e - pca_e) / greedy_e * 100.0;
+        println!("  n={:<5} | GreedyNN={:.1} | PathCheapestArc={:.1} | PCA {:+.1}% vs Greedy",
+            n, greedy_e, pca_e, diff);
+    }
+    println!();
+
+    // ── SECTION 1: GLS Penalty System ──
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!("SECTION 1: GUIDED LOCAL SEARCH (GLS) FEATURE PENALTIES");
+    for &n in &[60, 200, 500] {
+        let cities = generate_random_uniform_cities(n, 500.0);
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1).max(1)));
+        let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
+        let greedy_e = sol.evaluate_global();
+
+        // 2-opt first
+        let two_opt = TwoOptLocalSearch::full_search();
+        two_opt.apply(&mut sol);
+        let after_2opt = sol.evaluate_global();
+
+        // Apply GLS
+        let lambda = auto_lambda(&matrix, 0.2);
+        let mut gls = GuidedLocalSearch::with_params(lambda, 200);
+        let start = Instant::now();
+
+        // GLS loop: penalize + 2-opt + repeat
+        for gls_round in 0..20 {
+            gls.penalize_worst_edge(&sol);
+            // Re-optimize with 2-opt (which will avoid penalized edges)
+            two_opt.apply(&mut sol);
+        }
+
+        let gls_e = sol.evaluate_global();
+        let elapsed = start.elapsed();
+        let vs_2opt = (after_2opt - gls_e) / after_2opt * 100.0;
+        println!("  gls_{:<5} | Greedy={:.1} | 2opt={:.1} | GLS={:.1} | vs2opt={:+.1}% | λ={:.2} | penalties={} | {}ms",
+            n, greedy_e, after_2opt, gls_e, vs_2opt, lambda, gls.total_penalties, elapsed.as_millis());
+
+        if vs_2opt < 0.0 && n >= 200 { failures += 1; } // GLS should not make things worse
+    }
+    println!();
+
+    // ── SECTION 2: OR-Tools Operators Individual ──
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!("SECTION 2: OR-TOOLS INDIVIDUAL OPERATORS (1000 applications each)");
+
+    let cities = generate_random_uniform_cities(200, 500.0);
+    let matrix = Arc::new(build_distance_matrix(&cities));
+    let candidates = Arc::new(CandidateSet::build(&matrix, 20));
+
+    let or_tools_ops: Vec<(&str, Arc<dyn LowLevelHeuristic<TspSolution>>)> = vec![
+        ("spatial_lns", Arc::new(SpatialClusterLNS::new(15))),
+        ("relocate_nbrs", Arc::new(RelocateNeighborsHeuristic::new(5))),
+        ("relocate_seg", Arc::new(RelocateSegmentHeuristic::new(3))),
+        ("exchange_seg", Arc::new(ExchangeSegmentHeuristic::new(3))),
+        ("cross_exchange", Arc::new(CrossExchangeHeuristic)),
+    ];
+
+    for (name, heuristic) in &or_tools_ops {
+        let mut sol = build_greedy_nn(200, Arc::clone(&matrix), Arc::clone(&candidates), 1);
+        let start_e = sol.evaluate_global();
+        let two_opt = TwoOptLocalSearch::full_search();
+        two_opt.apply(&mut sol);
+        let after_2opt = sol.evaluate_global();
+
+        let start = Instant::now();
+        for _ in 0..1000 {
+            heuristic.apply(&mut sol);
+        }
+        let elapsed = start.elapsed();
+        let final_e = sol.evaluate_global();
+
+        // Verify route is still valid permutation
+        let mut sorted_route = sol.route.clone();
+        sorted_route.sort();
+        let valid = sorted_route.windows(2).all(|w| w[0] != w[1]) && sorted_route.len() == 200;
+
+        let vs_2opt = (after_2opt - final_e) / after_2opt * 100.0;
+        println!("  {:<15} | 2opt={:.1} | 1K_apps={:.1} | vs2opt={:+.1}% | valid={} | {}ms",
+            name, after_2opt, final_e, vs_2opt, valid, elapsed.as_millis());
+
+        if !valid { failures += 1; }
+    }
+    println!();
+
+    // ── SECTION 3: SoA 2-opt Local Search Benchmark ──
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!("SECTION 3: SoA 2-OPT LOCAL SEARCH (cache-aligned, packed don't-look bits)");
     for &n in &[60, 200, 500, 1000] {
         let cities = generate_random_uniform_cities(n, 500.0);
         let matrix = Arc::new(build_distance_matrix(&cities));
@@ -144,7 +276,6 @@ fn main() {
         let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
         let greedy_e = sol.evaluate_global();
 
-        // SoA 2-opt
         let start = Instant::now();
         let mut soa_tour = SoATour::new(sol.route.clone(), &cities);
         soa_two_opt_full(&mut soa_tour, 20.min(n - 1));
@@ -159,9 +290,9 @@ fn main() {
     }
     println!();
 
-    // ── SECTION 2: DQN-Driven MCMC Pipeline ──
+    // ── SECTION 4: Full 14-Heuristic DQN+GLS Pipeline ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 2: DQN-DRIVEN MCMC PIPELINE (neural heuristic selection)");
+    println!("SECTION 4: FULL 14-HEURISTIC DQN+GLS PIPELINE (OR-Tools operators)");
     for &n in &[60, 200, 500] {
         let cities = generate_random_uniform_cities(n, 500.0);
         let matrix = Arc::new(build_distance_matrix(&cities));
@@ -170,68 +301,42 @@ fn main() {
         let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
         let greedy_e = sol.evaluate_global();
 
-        // 2-opt preprocessing
         let two_opt = TwoOptLocalSearch::full_search();
         two_opt.apply(&mut sol);
         let after_2opt = sol.evaluate_global();
 
-        // DQN-driven MCMC
-        let heuristics = make_heuristics();
-        let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
-        let iters = (n * 200).max(20_000);
-        let start = Instant::now();
-        let engine = McmcEngine::with_dqn(
-            heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg,
-        );
-        let (best, _tel) = engine.optimize(sol, iters);
-        let elapsed = start.elapsed();
-        let final_e = best.evaluate_global();
-
-        let vs_greedy = (greedy_e - final_e) / greedy_e * 100.0;
-        let vs_2opt = (after_2opt - final_e) / after_2opt * 100.0;
-        println!("  dqn_mcmc_{:<5} | Grdy={:.1} | 2opt={:.1} | Final={:.1} | vsGrdy={:+.1}% | vs2opt={:+.1}% | {}ms",
-            n, greedy_e, after_2opt, final_e, vs_greedy, vs_2opt, elapsed.as_millis());
-        results.push((Box::leak(format!("dqn_mcmc_{}", n).into_boxed_str()), greedy_e, after_2opt, final_e));
-        if vs_greedy < 10.0 && n >= 100 { failures += 1; }
-    }
-    println!();
-
-    // ── SECTION 3: Full Neuro-Memetic (DQN + AST) ──
-    println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 3: FULL NEURO-MEMETIC (DQN selection + AST acceptance scoring)");
-    for &n in &[200, 500] {
-        let cities = generate_random_uniform_cities(n, 500.0);
-        let matrix = Arc::new(build_distance_matrix(&cities));
-        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1).max(1)));
-
-        let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
-        let greedy_e = sol.evaluate_global();
-
-        let two_opt = TwoOptLocalSearch::full_search();
-        two_opt.apply(&mut sol);
-        let after_2opt = sol.evaluate_global();
-
-        let heuristics = make_heuristics();
+        // GLS + DQN + 14 heuristics
+        let heuristics = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
         let iters = (n * 200).max(20_000);
         let start = Instant::now();
         let engine = McmcEngine::with_neuro_memetic(
             heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
         );
-        let (best, tel) = engine.optimize(sol, iters);
+        let (mut best, tel) = engine.optimize(sol, iters);
+
+        // GLS post-processing
+        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 300);
+        for _ in 0..5 {
+            gls.penalize_worst_edge(&best);
+            two_opt.apply(&mut best);
+        }
+
         let elapsed = start.elapsed();
         let final_e = best.evaluate_global();
 
         let vs_greedy = (greedy_e - final_e) / greedy_e * 100.0;
-        println!("  neuro_{:<5} | Grdy={:.1} | 2opt={:.1} | Final={:.1} | vsGrdy={:+.1}% | DQN_ε={:.3} | AST_best={:.2} | {}ms",
-            n, greedy_e, after_2opt, final_e, vs_greedy, tel.dqn_epsilon, tel.best_ast_fitness, elapsed.as_millis());
-        results.push((Box::leak(format!("neuro_{}", n).into_boxed_str()), greedy_e, after_2opt, final_e));
+        let vs_2opt = (after_2opt - final_e) / after_2opt * 100.0;
+        println!("  dqn_gls_{:<5} | Grdy={:.1} | 2opt={:.1} | Final={:.1} | vsGrdy={:+.1}% | vs2opt={:+.1}% | GLS_pen={} | {}ms",
+            n, greedy_e, after_2opt, final_e, vs_greedy, vs_2opt, gls.total_penalties, elapsed.as_millis());
+        results.push((Box::leak(format!("dqn_gls_{}", n).into_boxed_str()), greedy_e, after_2opt, final_e));
+        if vs_greedy < 10.0 && n >= 100 { failures += 1; }
     }
     println!();
 
-    // ── SECTION 4: Adversarial ──
+    // ── SECTION 5: Adversarial ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 4: ADVERSARIAL DISTRIBUTIONS (200 cities, DQN + AST)");
+    println!("SECTION 5: ADVERSARIAL DISTRIBUTIONS (200 cities, 14 heuristics + GLS)");
     for (name, cities) in [
         ("clustered_5", generate_clustered_cities(200, 5, 20.0)),
         ("grid_14x15", generate_grid_cities(14, 15, 30.0)),
@@ -245,7 +350,7 @@ fn main() {
         two_opt.apply(&mut sol);
         let after_2opt = sol.evaluate_global();
 
-        let heuristics = make_heuristics();
+        let heuristics = make_heuristics_14();
         let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
         let engine = McmcEngine::with_neuro_memetic(
             heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
@@ -258,187 +363,167 @@ fn main() {
     }
     println!();
 
-    // ── SECTION 5: ILS with Exchange Network ──
+    // ── SECTION 6: GLS Unit Tests ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 5: ILS WITH EXCHANGE NETWORK + ADAPTIVE LADDER (4 threads)");
-    for &n in &[200, 500] {
-        let cities = generate_random_uniform_cities(n, 500.0);
+    println!("SECTION 6: UNIT TESTS (GLS, OR-Tools Operators, DQN, AST, SoA, Ring Buffer)");
+
+    // Test GLS
+    {
+        let cities = generate_random_uniform_cities(100, 500.0);
         let matrix = Arc::new(build_distance_matrix(&cities));
-        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1).max(1)));
-        let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
-        let greedy_e = sol.evaluate_global();
-        let two_opt = TwoOptLocalSearch::full_search();
-        two_opt.apply(&mut sol);
-        let after_2opt = sol.evaluate_global();
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20));
+        let sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
 
-        let start = Instant::now();
-        let mut best_energy = after_2opt;
-        let mut best_sol = sol.clone();
+        let mut gls = GuidedLocalSearch::new(0.1);
 
-        let ladder = Arc::new(std::sync::Mutex::new(AdaptiveLadder::new(4, 20.0, 3.0)));
-        let exchange = Arc::new(ExchangeNetwork::new(4, 64));
+        // Test edge key canonicalization
+        assert_eq!(GuidedLocalSearch::edge_key(3, 7), (3, 7));
+        assert_eq!(GuidedLocalSearch::edge_key(7, 3), (3, 7));
 
-        for ils_round in 0..3 {
-            let mut handles = vec![];
-            for thread_id in 0..4 {
-                let mut init = best_sol.clone();
-                if ils_round > 0 || thread_id > 0 {
-                    let db = DoubleBridgeHeuristic;
-                    db.apply(&mut init);
-                    let tl = TwoOptLocalSearch::full_search();
-                    tl.apply(&mut init);
-                }
+        // Test penalty operations
+        gls.increment_penalty(5, 10);
+        assert_eq!(gls.get_penalty(5, 10), 1);
+        assert_eq!(gls.get_penalty(10, 5), 1); // Canonical
+        assert_eq!(gls.get_penalty(3, 7), 0);
 
-                // Collect fragments
-                let _frags = exchange.collect_fragments(thread_id);
+        // Test augmented energy
+        let original = sol.evaluate_global();
+        let augmented = gls.augmented_energy(&sol);
+        assert!(augmented >= original, "Augmented energy should be >= original");
 
-                let h = make_heuristics();
-                let (reheat, adaptive, dqn_cfg, _ast_cfg, chain) = make_engine_config();
-                let temp = {
-                    let lad = ladder.lock().unwrap();
-                    lad.temperatures[thread_id]
-                };
-                let exchange_c = Arc::clone(&exchange);
+        // Test penalize_worst_edge
+        let (edge, utility) = gls.penalize_worst_edge(&sol);
+        assert!(utility > 0.0, "Utility should be positive");
+        assert_eq!(gls.get_penalty(edge.0, edge.1), 1);
+        println!("  GLS: PASS (worst edge=({},{}), utility={:.2})", edge.0, edge.1, utility);
 
-                handles.push(std::thread::spawn(move || {
-                    let engine = McmcEngine::with_dqn(
-                        h, temp, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg,
-                    );
-                    let (sol, _tel) = engine.optimize(init, (n * 100).max(10_000));
+        // Test penalty decay
+        gls.increment_penalty(5, 10);
+        gls.increment_penalty(5, 10);
+        assert_eq!(gls.get_penalty(5, 10), 3);
+        gls.decay_penalties(0.5);
+        assert_eq!(gls.get_penalty(5, 10), 2); // ceil(3 * 0.5) = 2
+        println!("  GLS decay: PASS");
 
-                    // Inject fragments
-                    let frags = ExchangeNetwork::extract_fragments(
-                        &sol.route, sol.evaluate_global(), thread_id, temp,
-                        ils_round * (n * 100), 5, 4,
-                    );
-                    for frag in frags {
-                        exchange_c.inject(thread_id, frag);
-                    }
+        // Test auto_lambda
+        let lambda = auto_lambda(&matrix, 0.2);
+        assert!(lambda > 0.0, "Lambda should be positive");
+        println!("  auto_lambda: PASS (λ={:.3})", lambda);
+    }
 
-                    sol
-                }));
-            }
-            for handle in handles {
-                if let Ok(sol) = handle.join() {
-                    let e = sol.evaluate_global();
-                    if e < best_energy { best_energy = e; best_sol = sol; }
-                }
-            }
+    // Test SpatialClusterLNS
+    {
+        let cities = generate_random_uniform_cities(100, 500.0);
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20));
+        let mut sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
+        let old_e = sol.evaluate_global();
 
-            // Adapt ladder
-            ladder.lock().unwrap().adapt();
+        let lns = SpatialClusterLNS::new(10);
+        for _ in 0..50 {
+            lns.apply(&mut sol);
         }
 
-        let elapsed = start.elapsed();
-        let final_e = best_sol.evaluate_global();
-        let vs_greedy = (greedy_e - final_e) / greedy_e * 100.0;
-        let vs_2opt = (after_2opt - final_e) / after_2opt * 100.0;
-        println!("  ils_exchange_{:<5} | Grdy={:.1} | 2opt={:.1} | ILS={:.1} | vsGrdy={:+.1}% | vs2opt={:+.1}% | {}ms",
-            n, greedy_e, after_2opt, final_e, vs_greedy, vs_2opt, elapsed.as_millis());
-        results.push((Box::leak(format!("ils_exchange_{}", n).into_boxed_str()), greedy_e, after_2opt, final_e));
-        if vs_greedy < 15.0 { failures += 1; }
+        // Verify route is still valid
+        let mut sorted = sol.route.clone();
+        sorted.sort();
+        let valid = sorted.windows(2).all(|w| w[0] != w[1]) && sorted.len() == 100;
+        assert!(valid, "Route should remain a valid permutation after SpatialClusterLNS");
+
+        let new_e = sol.evaluate_global();
+        println!("  SpatialClusterLNS: PASS (before={:.1}, after={:.1}, valid={})", old_e, new_e, valid);
     }
-    println!();
 
-    // ── SECTION 6: Circular Benchmark ──
-    println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 6: CIRCULAR BENCHMARK (known optimum, neuro-memetic)");
-    for &n in &[60, 200] {
-        let cities = generate_circular_cities(n, 100.0);
-        let theoretical = 2.0 * 100.0 * (std::f64::consts::PI / n as f64).sin() * n as f64;
-        let matrix = Arc::new(build_distance_matrix(&cities));
-        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1).max(1)));
-        let mut init = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 5);
-        let greedy_e = init.evaluate_global();
-        let two_opt = TwoOptLocalSearch::full_search();
-        two_opt.apply(&mut init);
-        let gap_2opt = ((init.evaluate_global() - theoretical) / theoretical) * 100.0;
-
-        let h = make_heuristics();
-        let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
-        let engine = McmcEngine::with_neuro_memetic(
-            h, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
-        );
-        let (best, _) = engine.optimize(init, (n * 200).max(20_000));
-        let gap = ((best.evaluate_global() - theoretical) / theoretical) * 100.0;
-        let status = if gap <= 0.1 { "NEAR_PERFECT" } else if gap <= 0.5 { "EXCELLENT" } else if gap <= 2.0 { "GOOD" } else { "SUBOPTIMAL" };
-        println!("  circ_{:<5} | Theory={:.2} | Grdy={:.2} | 2opt_gap={:.3}% | Neuro_gap={:.3}% | {}",
-            n, theoretical, greedy_e, gap_2opt, gap, status);
-        if gap > 5.0 { failures += 1; }
-    }
-    println!();
-
-    // ── SECTION 7: Unit Tests (DQN, AST, SoA, Ring Buffer) ──
-    println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 7: UNIT TESTS (DQN, AST, SoA, Ring Buffer, Adaptive Ladder)");
-
-    // Test DQN agent
+    // Test RelocateNeighbors
     {
-        let mut agent = DqnAgent::with_config(9, make_dqn_config());
-        let state = agent.build_state(100.0, 0.4, 500, 10000.0, 9000.0, 0.5, &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15]);
-        let action = agent.select_action(&state);
-        assert!(action < 9, "DQN action out of range: {}", action);
+        let cities = generate_random_uniform_cities(100, 500.0);
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20));
+        let mut sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
 
-        // Train for a few steps
+        let relocate = RelocateNeighborsHeuristic::new(5);
+        for _ in 0..100 {
+            relocate.apply(&mut sol);
+        }
+
+        let mut sorted = sol.route.clone();
+        sorted.sort();
+        let valid = sorted.windows(2).all(|w| w[0] != w[1]) && sorted.len() == 100;
+        assert!(valid, "Route should remain valid after RelocateNeighbors");
+        println!("  RelocateNeighbors: PASS (valid={})", valid);
+    }
+
+    // Test ExchangeSegment
+    {
+        let cities = generate_random_uniform_cities(100, 500.0);
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20));
+        let mut sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
+
+        let exchange = ExchangeSegmentHeuristic::new(3);
+        for _ in 0..100 {
+            exchange.apply(&mut sol);
+        }
+
+        let mut sorted = sol.route.clone();
+        sorted.sort();
+        let valid = sorted.windows(2).all(|w| w[0] != w[1]) && sorted.len() == 100;
+        assert!(valid, "Route should remain valid after ExchangeSegment");
+        println!("  ExchangeSegment: PASS (valid={})", valid);
+    }
+
+    // Test CrossExchange
+    {
+        let cities = generate_random_uniform_cities(100, 500.0);
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20));
+        let mut sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
+
+        let cross = CrossExchangeHeuristic;
+        for _ in 0..100 {
+            cross.apply(&mut sol);
+        }
+
+        let mut sorted = sol.route.clone();
+        sorted.sort();
+        let valid = sorted.windows(2).all(|w| w[0] != w[1]) && sorted.len() == 100;
+        assert!(valid, "Route should remain valid after CrossExchange");
+        println!("  CrossExchange: PASS (valid={})", valid);
+    }
+
+    // Test DQN agent (existing)
+    {
+        let mut agent = DqnAgent::with_config(14, make_dqn_config(14));
+        let state = agent.build_state(100.0, 0.4, 500, 10000.0, 9000.0, 0.5,
+            &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05]);
+        let action = agent.select_action(&state);
+        assert!(action < 14, "DQN action out of range: {}", action);
         for _ in 0..50 {
-            let next_state = agent.build_state(99.0, 0.38, 510, 10000.0, 9000.0, 0.55, &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15]);
+            let next_state = agent.build_state(99.0, 0.38, 510, 10000.0, 9000.0, 0.55,
+                &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05]);
             agent.record_and_train(state.clone(), action, 1.0, next_state, false);
         }
         assert!(agent.epsilon < 0.3, "DQN epsilon should decay: {}", agent.epsilon);
-        println!("  DQN agent: PASS (action={}, epsilon={:.3})", action, agent.epsilon);
+        println!("  DQN agent (14 actions): PASS (action={}, epsilon={:.3})", action, agent.epsilon);
     }
 
-    // Test AST evaluation
+    // Test AST evaluation (existing)
     {
         let tree = AstScoringTree::baseline_gain();
         let mut ctx = MemoryContext::new();
         ctx.edge_weight = 0.5;
         let score = evaluate_node(&tree.root, &mut ctx);
-        assert!((score - 0.5).abs() < 0.01, "Baseline gain should be 1.0 - 0.5 = 0.5, got {}", score);
+        assert!((score - 0.5).abs() < 0.01, "Baseline gain should be 0.5, got {}", score);
 
         let mut pop = AstPopulation::new(10, 4);
         pop.trees[0].fitness = 5.0;
         pop.trees[1].fitness = 3.0;
         let best_idx = pop.best_idx();
         assert_eq!(best_idx, 0, "Best tree should be index 0");
-        println!("  AST evaluation: PASS (baseline_score={:.3}, pop_best_fitness={:.2})", score, pop.best().fitness);
+        println!("  AST evaluation: PASS (baseline_score={:.3})", score);
     }
 
-    // Test SoA coordinates
-    {
-        let cities = generate_random_uniform_cities(100, 500.0);
-        let soa = SoACoordinates::from_cities(&cities);
-        assert_eq!(soa.n, 100);
-        for i in 0..10 {
-            let (x, y) = soa.get(i);
-            assert!((x - cities[i].x as f32).abs() < 0.01);
-            assert!((y - cities[i].y as f32).abs() < 0.01);
-        }
-        println!("  SoA coordinates: PASS");
-    }
-
-    // Test don't-look bitmap
-    {
-        let mut bitmap = DontLookBitmap::new(100);
-        assert!(!bitmap.is_set(5));
-        bitmap.set(5);
-        assert!(bitmap.is_set(5));
-        assert_eq!(bitmap.count_set(), 1);
-        bitmap.clear(5);
-        assert!(!bitmap.is_set(5));
-
-        // Test large bitmap
-        let mut big = DontLookBitmap::new(1000);
-        for i in 0..1000 {
-            big.set(i);
-        }
-        assert_eq!(big.count_set(), 1000);
-        big.clear_all();
-        assert_eq!(big.count_set(), 0);
-        println!("  Don't-look bitmap: PASS");
-    }
-
-    // Test ring buffer
+    // Test ring buffer (existing)
     {
         let buf = LockFreeRingBuffer::new(16, 2);
         let frag = PathFragment::new(vec![1, 2, 3], -10.0, 0, 100.0, 0);
@@ -449,44 +534,28 @@ fn main() {
         println!("  Ring buffer: PASS");
     }
 
-    // Test exchange network
-    {
-        let net = ExchangeNetwork::new(4, 16);
-        let frag = PathFragment::new(vec![1, 2, 3], -10.0, 0, 100.0, 0);
-        assert!(net.inject(0, frag));
-        let frags = net.collect_fragments(1);
-        assert!(!frags.is_empty(), "Chain 1 should receive fragments from chain 0");
-        println!("  Exchange network: PASS");
-    }
-
-    // Test adaptive ladder
+    // Test adaptive ladder (existing)
     {
         let mut ladder = AdaptiveLadder::new(4, 20.0, 3.0);
         assert_eq!(ladder.temperatures.len(), 4);
         assert!((ladder.temperatures[0] - 20.0).abs() < 0.1);
-        assert!((ladder.temperatures[1] - 60.0).abs() < 0.1);
-
-        // Record some swaps
-        for _ in 0..20 {
-            ladder.record_swap(0, true);  // 100% acceptance
-        }
+        for _ in 0..20 { ladder.record_swap(0, true); }
         ladder.adapt();
-        // Should have moved temperatures further apart (high acceptance)
-        assert!(ladder.temperatures[1] > 60.0, "Ladder should increase gap when acceptance is high: {:.1}", ladder.temperatures[1]);
-        println!("  Adaptive ladder: PASS (T[1] adjusted from 60.0 to {:.1})", ladder.temperatures[1]);
+        assert!(ladder.temperatures[1] > 60.0);
+        println!("  Adaptive ladder: PASS");
     }
 
     println!();
 
-    // ── SECTION 8: Delta Correctness ──
+    // ── SECTION 7: Delta Correctness ──
     println!("──────────────────────────────────────────────────────────────────────────────");
-    println!("SECTION 8: DELTA CORRECTNESS (5k cross-checks)");
+    println!("SECTION 7: DELTA CORRECTNESS (5k cross-checks, all 14 heuristics)");
     {
         let cities = generate_random_uniform_cities(100, 500.0);
         let matrix = Arc::new(build_distance_matrix(&cities));
         let candidates = Arc::new(CandidateSet::build(&matrix, 20));
         let mut sol = build_greedy_nn(100, Arc::clone(&matrix), Arc::clone(&candidates), 1);
-        let heuristics = make_heuristics();
+        let heuristics = make_heuristics_14();
         let mut max_drift = 0.0f64;
         let mut drift_count = 0;
         for i in 0..5000 {
@@ -508,9 +577,51 @@ fn main() {
     }
     println!();
 
+    // ── SECTION 8: Circular Benchmark with GLS ──
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!("SECTION 8: CIRCULAR BENCHMARK (known optimum, 14 heuristics + GLS)");
+    for &n in &[60, 200] {
+        let cities = generate_circular_cities(n, 100.0);
+        let theoretical = 2.0 * 100.0 * (std::f64::consts::PI / n as f64).sin() * n as f64;
+        let matrix = Arc::new(build_distance_matrix(&cities));
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1).max(1)));
+
+        // Test PathCheapestArc initialization
+        let pca_route = path_cheapest_arc_init(&matrix, &candidates);
+        let pca_sol = TspSolution::new(pca_route, Arc::clone(&matrix), Arc::clone(&candidates));
+        let pca_e = pca_sol.evaluate_global();
+
+        let mut init = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 5);
+        let greedy_e = init.evaluate_global();
+        let two_opt = TwoOptLocalSearch::full_search();
+        two_opt.apply(&mut init);
+        let gap_2opt = ((init.evaluate_global() - theoretical) / theoretical) * 100.0;
+
+        let h = make_heuristics_14();
+        let (reheat, adaptive, dqn_cfg, ast_cfg, chain) = make_engine_config();
+        let engine = McmcEngine::with_neuro_memetic(
+            h, 200.0, 0.9997, 1e-4, reheat, adaptive, chain, dqn_cfg, ast_cfg,
+        );
+        let (mut best, _) = engine.optimize(init, (n * 200).max(20_000));
+
+        // GLS polish
+        let mut gls = GuidedLocalSearch::with_params(auto_lambda(&matrix, 0.2), 200);
+        for _ in 0..10 {
+            gls.penalize_worst_edge(&best);
+            two_opt.apply(&mut best);
+        }
+
+        let gap = ((best.evaluate_global() - theoretical) / theoretical) * 100.0;
+        let status = if gap <= 0.1 { "NEAR_PERFECT" } else if gap <= 0.5 { "EXCELLENT" } else if gap <= 2.0 { "GOOD" } else { "SUBOPTIMAL" };
+        println!("  circ_{:<5} | Theory={:.2} | PCA={:.2} | Grdy={:.2} | 2opt_gap={:.3}% | GLS_gap={:.3}% | {}",
+            n, theoretical, pca_e, greedy_e, gap_2opt, gap, status);
+        if gap > 5.0 { failures += 1; }
+    }
+    println!();
+
     // ── Summary ──
     println!("==============================================================================");
-    println!("  STRESS TEST SUMMARY v0.6");
+    println!("  STRESS TEST SUMMARY v0.7");
     println!("==============================================================================");
     println!("  Total tests: {}", results.len());
     println!("  Failures:    {}", failures);

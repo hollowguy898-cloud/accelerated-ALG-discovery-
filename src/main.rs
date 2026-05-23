@@ -1,17 +1,17 @@
 // src/main.rs
-// MCMC-driven Hyper-Heuristic Framework v0.6 — "Neuro-Memetic Demon"
+// MCMC-driven Hyper-Heuristic Framework v0.7 — "OR-Tools Demon"
 //
-// v0.6 is the neuro-memetic upgrade:
-// - DQN (Deep Q-Network) for adaptive heuristic selection
-// - Self-evolving AST for context-aware acceptance scoring
-// - SoA (Structure of Arrays) data layout with cache-aligned coordinates
-// - Lock-free ring buffer for asymmetric elite exchange between chains
-// - Adaptive temperature ladder with swap-rate-based adjustment
-// - All v0.5 features preserved (candidate pruning, don't-look bits, LK, 3-opt, ILS)
+// v0.7 is the OR-Tools integration upgrade:
+// - Guided Local Search (GLS) feature penalties replace simple reheat
+// - Spatial-Clustered LNS replaces random ruin-recreate
+// - RelocateNeighbors "snaking" operator
+// - Relocate/Exchange/CrossExchange segment operators
+// - Path-Cheapest-Arc initialization (isolation-aware)
+// - All v0.6 features preserved (DQN, AST, SoA, lock-free exchange, adaptive tempering)
 //
 // Architecture:
-//   RL-driven selection (DQN) + AST-modulated acceptance + Global exploration
-//   + Aggressive local optimization (2-opt + LK + 3-opt) + Candidate pruning
+//   RL-driven selection (DQN) + AST-modulated acceptance + GLS penalty escape
+//   + Spatial LNS diversification + Snaking relocation + Candidate pruning
 //   + Lock-free fragment exchange + Adaptive tempering
 
 mod core;
@@ -23,10 +23,15 @@ use core::rl::DqnConfig;
 use core::LowLevelHeuristic;
 use core::Solution;
 use domain::candidates::CandidateSet;
+use domain::gls::GuidedLocalSearch;
 use domain::heuristics::{
     DoubleBridgeHeuristic, InvertSegmentHeuristic, LinKernighanHeuristic, OrOptHeuristic,
     RuinRecreateHeuristic, SwapCitiesHeuristic, ThreeOptCandidate, TwoOptBestOfK,
     TwoOptLocalSearch,
+};
+use domain::or_tools::{
+    CrossExchangeHeuristic, ExchangeSegmentHeuristic, RelocateNeighborsHeuristic,
+    RelocateSegmentHeuristic, SpatialClusterLNS, path_cheapest_arc_init,
 };
 use domain::soa::{soa_two_opt_full, SoATour};
 use domain::{City, TspSolution};
@@ -101,10 +106,10 @@ impl ElitePool {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  MCMC-Driven Hyper-Heuristic Framework  v0.6                           ║");
-    println!("║  Neuro-Memetic Demon                                                    ║");
-    println!("║  DQN + AST | SoA Layout | Lock-Free Exchange | Adaptive Tempering      ║");
-    println!("║  LK + 2-opt-local + 3-opt | Candidate Pruning | ILS                    ║");
+    println!("║  MCMC-Driven Hyper-Heuristic Framework  v0.7                           ║");
+    println!("║  OR-Tools Demon                                                        ║");
+    println!("║  GLS + SpatialLNS | Snaking | DQN + AST | SoA | Lock-Free Exchange    ║");
+    println!("║  PathCheapestArc | Relocate/Exchange/Cross | Adaptive Tempering        ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -125,25 +130,15 @@ fn main() {
     let shared_matrix = Arc::new(matrix);
     let candidate_set = Arc::new(CandidateSet::build(&shared_matrix, 20));
 
-    // 9 heuristics — the full research-grade lineup
-    let heuristics: Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> = vec![
-        Arc::new(TwoOptLocalSearch::single_pass()),
-        Arc::new(LinKernighanHeuristic { kick_rounds: 3 }),
-        Arc::new(ThreeOptCandidate { samples: 15 }),
-        Arc::new(DoubleBridgeHeuristic),
-        Arc::new(RuinRecreateHeuristic { ruin_fraction: 0.15 }),
-        Arc::new(OrOptHeuristic { max_segment_len: 3 }),
-        Arc::new(TwoOptBestOfK { k: 15 }),
-        Arc::new(InvertSegmentHeuristic),
-        Arc::new(SwapCitiesHeuristic),
-    ];
-    let shared_heuristics = Arc::new(heuristics);
+    // ── Phase 1: Path-Cheapest-Arc initialization (OR-Tools smart init) ──
+    println!("Phase 1: Path-Cheapest-Arc initialization (OR-Tools isolation-aware)...");
 
-    // ── Phase 1: Multi-start Greedy NN initialization ──
-    println!("Phase 1: Multi-start Greedy NN initialization...");
-    let num_starts = 10;
+    // Multi-start with both greedy NN and path-cheapest-arc
+    let num_starts = 5;
     let mut best_init: Option<TspSolution> = None;
     let mut best_init_energy = f64::MAX;
+
+    // Greedy NN starts
     for s in 0..num_starts {
         let mut rng = rand::thread_rng();
         let n = shared_matrix.len();
@@ -163,7 +158,19 @@ fn main() {
             best_init_energy = e;
             best_init = Some(sol);
         }
-        println!("  Start {} | Energy: {:.2}", s, e);
+        println!("  Greedy NN start {} | Energy: {:.2}", s, e);
+    }
+
+    // Path-Cheapest-Arc starts (isolation-aware from OR-Tools)
+    for s in 0..num_starts {
+        let route = path_cheapest_arc_init(&shared_matrix, &candidate_set);
+        let sol = TspSolution::new(route, Arc::clone(&shared_matrix), Arc::clone(&candidate_set));
+        let e = sol.evaluate_global();
+        if e < best_init_energy {
+            best_init_energy = e;
+            best_init = Some(sol);
+        }
+        println!("  PathCheapestArc {} | Energy: {:.2}", s, e);
     }
 
     // ── Phase 2: SoA-accelerated 2-opt preprocessing ──
@@ -171,24 +178,44 @@ fn main() {
     let mut init_sol = best_init.unwrap();
     let pre_energy = init_sol.evaluate_global();
 
-    // Build SoA tour for fast 2-opt
     let mut soa_tour = SoATour::new(init_sol.route.clone(), &cities);
     let soa_start = std::time::Instant::now();
     let soa_improvement = soa_two_opt_full(&mut soa_tour, 20);
     let soa_elapsed = soa_start.elapsed();
 
-    // Sync SoA route back to TspSolution
     init_sol.route = soa_tour.route.clone();
     let post_2opt_energy = init_sol.evaluate_global();
 
-    println!("  Greedy NN:      {:.2}", pre_energy);
+    println!("  Best init:      {:.2}", pre_energy);
     println!("  After 2-opt:    {:.2} (improvement: {:.1}%)",
         post_2opt_energy, (pre_energy - post_2opt_energy) / pre_energy * 100.0);
     println!("  SoA 2-opt time: {:?}", soa_elapsed);
     println!("  SoA improvement: {:.2}", soa_improvement);
 
-    // ── Phase 3: Parallel ILS with DQN + AST Neuro-Memetic Engine ──
-    println!("\nPhase 3: Parallel ILS with Neuro-Memetic Engine (DQN + AST + Exchange)...");
+    // ── Phase 3: Parallel ILS with GLS + OR-Tools Operators ──
+    println!("\nPhase 3: Parallel ILS with GLS + OR-Tools Operators...");
+
+    // 14 heuristics — the full research-grade OR-Tools lineup
+    let heuristics: Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> = vec![
+        // Tier 1: Core local search
+        Arc::new(TwoOptLocalSearch::single_pass()),
+        Arc::new(LinKernighanHeuristic { kick_rounds: 3 }),
+        Arc::new(ThreeOptCandidate { samples: 15 }),
+        // Tier 2: OR-Tools operators
+        Arc::new(SpatialClusterLNS::new(15)),         // Targeted geographic ruin-recreate
+        Arc::new(RelocateNeighborsHeuristic::new(5)),  // "Snaking" operator
+        Arc::new(RelocateSegmentHeuristic::new(3)),    // Or-Tools Relocate
+        Arc::new(ExchangeSegmentHeuristic::new(3)),    // Or-Tools Exchange
+        Arc::new(CrossExchangeHeuristic),              // Or-Tools CrossExchange
+        // Tier 3: Diversification & fine-tuning
+        Arc::new(DoubleBridgeHeuristic),
+        Arc::new(RuinRecreateHeuristic { ruin_fraction: 0.15 }),
+        Arc::new(OrOptHeuristic { max_segment_len: 3 }),
+        Arc::new(TwoOptBestOfK { k: 15 }),
+        Arc::new(InvertSegmentHeuristic),
+        Arc::new(SwapCitiesHeuristic),
+    ];
+    let shared_heuristics = Arc::new(heuristics);
 
     let num_threads = 4;
     let ils_iterations = 3;
@@ -199,13 +226,15 @@ fn main() {
 
     let best_overall = Arc::new((AtomicU64::new(f64::to_bits(post_2opt_energy)), Mutex::new(init_sol.clone())));
 
-    // Adaptive temperature ladder
     let ladder = Arc::new(Mutex::new(AdaptiveLadder::new(num_threads, 20.0, 3.0)));
-
-    // Lock-free exchange network
     let exchange = Arc::new(ExchangeNetwork::new(num_threads, 64));
 
-    // Shared DQN agent (initialized here, cloned per thread)
+    // GLS state (shared across all chains for consistent penalty landscape)
+    let gls = Arc::new(Mutex::new(GuidedLocalSearch::with_params(
+        domain::gls::auto_lambda(&shared_matrix, 0.2),
+        500, // stagnation threshold
+    )));
+
     let dqn_config = DqnConfig {
         learning_rate: 0.001,
         discount: 0.95,
@@ -217,7 +246,6 @@ fn main() {
         target_update_freq: 200,
     };
 
-    // Shared AST population
     let ast_config = AstConfig {
         population_size: 20,
         max_depth: 5,
@@ -226,6 +254,17 @@ fn main() {
 
     for ils_round in 0..ils_iterations {
         println!("\n  ─── ILS Round {}/{} ───", ils_round + 1, ils_iterations);
+
+        // GLS: penalize worst edges before each round
+        if ils_round > 0 {
+            let best_lock = best_overall.1.lock().unwrap();
+            let mut gls_state = gls.lock().unwrap();
+            let penalized = gls_state.penalize_top_k_edges(&best_lock, 3);
+            drop(best_lock);
+            for (edge, utility) in &penalized {
+                println!("    GLS: penalized edge ({}, {}) utility={:.2}", edge.0, edge.1, utility);
+            }
+        }
 
         let mut thread_handles = vec![];
 
@@ -237,8 +276,8 @@ fn main() {
             let best_clone = Arc::clone(&best_overall);
             let ladder_clone = Arc::clone(&ladder);
             let exchange_clone = Arc::clone(&exchange);
+            let gls_clone = Arc::clone(&gls);
 
-            // Get temperature from adaptive ladder
             let temp = {
                 let lad = ladder_clone.lock().unwrap();
                 lad.temperatures[thread_id]
@@ -299,15 +338,11 @@ fn main() {
                 let fragments = exchange_clone.collect_fragments(thread_id);
                 let fragment_count = fragments.len();
 
-                // If we received good fragments, try to inject them into our solution
                 if !fragments.is_empty() {
-                    // Simple injection: if a fragment is better than our current tour segment,
-                    // try to incorporate it (simplified: just use the best fragment as a perturbation hint)
                     let best_fragment = &fragments[0];
                     if best_fragment.is_good() && best_fragment.cities.len() >= 3 {
-                        // Apply ruin-recreate as a way to incorporate fragment knowledge
-                        let rr = RuinRecreateHeuristic { ruin_fraction: 0.1 };
-                        rr.apply(&mut start_sol);
+                        let lns = SpatialClusterLNS::new(10);
+                        lns.apply(&mut start_sol);
                     }
                 }
 
@@ -335,7 +370,24 @@ fn main() {
                     ast_config,
                 );
 
-                let (best_sol, telemetry) = engine.optimize(start_sol, max_iterations);
+                let (mut best_sol, telemetry) = engine.optimize(start_sol, max_iterations);
+
+                // GLS post-processing: apply penalties and re-optimize
+                {
+                    let mut gls_state = gls_clone.lock().unwrap();
+                    if gls_state.should_penalize(telemetry.reheat_count * 3000) {
+                        gls_state.penalize_worst_edge(&best_sol);
+                    }
+
+                    // Use GLS-augmented 2-opt for further improvement
+                    let penalty_cost = gls_state.penalty_cost(&best_sol);
+                    if penalty_cost > 0.0 {
+                        // The solution has penalized edges; try to improve
+                        let two_opt = TwoOptLocalSearch::full_search();
+                        two_opt.apply(&mut best_sol);
+                    }
+                }
+
                 let final_energy = best_sol.evaluate_global();
 
                 // Add to elite pool
@@ -349,8 +401,8 @@ fn main() {
                     thread_id,
                     temp,
                     ils_round * max_iterations,
-                    5,   // fragment length
-                    4,   // max fragments
+                    5,
+                    4,
                 );
                 for frag in frags {
                     exchange_clone.inject(thread_id, frag);
@@ -371,16 +423,17 @@ fn main() {
                     *lock = best_sol.clone();
                 }
 
-                (thread_id, start_energy, final_energy, telemetry.reheat_count, telemetry.dqn_epsilon, telemetry.best_ast_fitness, telemetry.avg_ast_fitness, fragment_count)
+                let gls_state = gls_clone.lock().unwrap();
+                (thread_id, start_energy, final_energy, telemetry.reheat_count, telemetry.dqn_epsilon, telemetry.best_ast_fitness, telemetry.avg_ast_fitness, fragment_count, gls_state.total_penalties, gls_state.num_penalized_edges())
             }));
         }
 
         // Collect results
         for handle in thread_handles {
-            if let Ok((tid, start_e, final_e, reheats, dqn_eps, best_ast, _avg_ast, frags)) = handle.join() {
+            if let Ok((tid, start_e, final_e, reheats, dqn_eps, best_ast, avg_ast, frags, gls_penalties, gls_edges)) = handle.join() {
                 let improvement = (start_e - final_e) / start_e * 100.0;
-                println!("    Thread {} | Start: {:.2} | Final: {:.2} | +{:.1}% | Reheats: {} | DQN_ε: {:.3} | AST_best: {:.2} | Frags_in: {}",
-                    tid, start_e, final_e, improvement, reheats, dqn_eps, best_ast, frags);
+                println!("    Thread {} | Start: {:.2} | Final: {:.2} | +{:.1}% | Reheats: {} | DQN_ε: {:.3} | AST: {:.2} | Frags: {} | GLS_pen: {} | GLS_edges: {}",
+                    tid, start_e, final_e, improvement, reheats, dqn_eps, best_ast, frags, gls_penalties, gls_edges);
             }
         }
 
@@ -398,8 +451,8 @@ fn main() {
         }
     }
 
-    // ── Phase 4: SoA-accelerated final polish ──
-    println!("\nPhase 4: SoA-accelerated final polish...");
+    // ── Phase 4: SoA-accelerated final polish with GLS ──
+    println!("\nPhase 4: SoA-accelerated final polish + GLS cleanup...");
     {
         let mut final_sol = best_overall.1.lock().unwrap();
         let before_polish = final_sol.evaluate_global();
@@ -409,13 +462,21 @@ fn main() {
         soa_two_opt_full(&mut soa_tour, 20);
         final_sol.route = soa_tour.route.clone();
 
+        // GLS: decay penalties and re-optimize
+        {
+            let mut gls_state = gls.lock().unwrap();
+            gls_state.decay_penalties(0.5);
+            let two_opt = TwoOptLocalSearch::full_search();
+            two_opt.apply(&mut final_sol);
+        }
+
         let after_polish = final_sol.evaluate_global();
         if after_polish < before_polish {
-            println!("  SoA polish improved: {:.4} -> {:.4} ({:.2}% gain)",
+            println!("  Polish improved: {:.4} -> {:.4} ({:.2}% gain)",
                 before_polish, after_polish,
                 (before_polish - after_polish) / before_polish * 100.0);
         } else {
-            println!("  Solution already at 2-opt optimum after Phase 3.");
+            println!("  Solution already at optimum after Phase 3.");
         }
     }
 
@@ -428,11 +489,16 @@ fn main() {
     let theoretical_optimum = arc_distance * num_cities as f64;
     let gap = ((final_energy - theoretical_optimum) / theoretical_optimum) * 100.0;
 
-    println!("║  Greedy NN:         {:.4}", pre_energy);
-    println!("║  After 2-opt:       {:.4}", post_2opt_energy);
-    println!("║  Final optimized:   {:.4}", final_energy);
-    println!("║  Theoretical:       {:.4}", theoretical_optimum);
-    println!("║  Gap from optimal:  {:.4}%", gap);
-    println!("║  Total improvement: {:.1}% (vs greedy)", (pre_energy - final_energy) / pre_energy * 100.0);
+    println!("║  Initial (best):   {:.4}", pre_energy);
+    println!("║  After 2-opt:      {:.4}", post_2opt_energy);
+    println!("║  Final optimized:  {:.4}", final_energy);
+    println!("║  Theoretical:      {:.4}", theoretical_optimum);
+    println!("║  Gap from optimal: {:.4}%", gap);
+    println!("║  Total improvement: {:.1}% (vs initial)", (pre_energy - final_energy) / pre_energy * 100.0);
+
+    // GLS summary
+    let gls_state = gls.lock().unwrap();
+    println!("║  GLS penalties:    {} edges penalized, {} total increments",
+        gls_state.num_penalized_edges(), gls_state.total_penalties);
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 }

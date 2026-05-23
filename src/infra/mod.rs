@@ -33,6 +33,10 @@ pub struct Telemetry {
     pub avg_ast_fitness: f64,
     /// Number of fragment exchanges across chains
     pub fragment_exchanges: usize,
+    /// Number of GLS penalty updates applied
+    pub gls_penalty_updates: usize,
+    /// Number of penalized edges at end of run
+    pub gls_penalized_edges: usize,
 }
 
 impl Telemetry {
@@ -48,6 +52,8 @@ impl Telemetry {
             best_ast_fitness: 0.0,
             avg_ast_fitness: 0.0,
             fragment_exchanges: 0,
+            gls_penalty_updates: 0,
+            gls_penalized_edges: 0,
         }
     }
 

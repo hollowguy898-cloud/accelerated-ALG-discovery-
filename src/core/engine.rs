@@ -1,15 +1,12 @@
 // src/core/engine.rs
-// MCMC-driven Hyper-Heuristic Engine v0.6 — "Neuro-Memetic Demon"
+// MCMC-driven Hyper-Heuristic Engine v0.7 — "OR-Tools Demon"
 //
-// Major features over v0.5:
-// - **DQN heuristic selection**: Replace static choice function with a
-//   Deep Q-Network that learns contextual policies from search state.
-// - **AST scoring**: Self-evolving Abstract Syntax Trees provide
-//   context-aware acceptance scoring, replacing static gain formulas.
-// - **Adaptive cooling**: Temperature adjusts based on acceptance rate.
-// - **Deep local search chains**: After improving move, apply same
-//   heuristic again up to chain_depth times.
-// - **Best-solution restart**: If stuck, reset to best + reheat.
+// v0.7 upgrades over v0.6:
+// - **GLS escape**: Guided Local Search feature penalties replace
+//   simple reheat. When stagnation is detected, edge penalties are
+//   updated and augmented energy is used for acceptance decisions.
+// - **All v0.6 features preserved**: DQN, AST, SoA, adaptive cooling,
+//   lock-free exchange, parallel tempering.
 //
 // The engine is completely decoupled from any specific problem domain
 // through the Solution and LowLevelHeuristic traits.
@@ -44,6 +41,37 @@ impl Default for ReheatConfig {
             max_reheats: 5,
         }
     }
+}
+
+/// Escape strategy when the search stagnates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EscapeStrategy {
+    /// Simple reheat: reset temperature and optionally restart from best
+    ReheatOnly,
+    /// Guided Local Search: penalize high-utility edges and use augmented energy
+    /// (requires domain-specific GLS implementation to be provided externally)
+    GuidedLocalSearch {
+        /// Lambda parameter for penalty augmentation
+        lambda: f64,
+        /// Stagnation threshold before applying GLS penalty
+        stagnation_threshold: usize,
+        /// Number of edges to penalize per GLS step
+        penalty_count: usize,
+        /// How often to decay penalties (in iterations, 0 = never)
+        penalty_decay_interval: usize,
+        /// Decay factor for penalties (e.g., 0.9)
+        penalty_decay_factor: f64,
+    },
+    /// Combined: use GLS first, fall back to reheat if GLS doesn't help
+    CombinedGLSReheat {
+        lambda: f64,
+        stagnation_threshold: usize,
+        penalty_count: usize,
+        penalty_decay_interval: usize,
+        penalty_decay_factor: f64,
+        reheat_fraction: f64,
+        max_reheats: usize,
+    },
 }
 
 /// Configuration for the choice function heuristic selection (legacy fallback).

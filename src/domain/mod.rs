@@ -6,12 +6,15 @@
 // problem: find the shortest possible route that visits every city
 // exactly once and returns to the origin.
 //
-// v0.6 additions:
-// - soa: Structure of Arrays layout with cache-aligned coordinates,
-//        packed don't-look bitmaps, and SIMD-friendly distance matrix
+// v0.7 additions:
+// - gls: Guided Local Search feature penalties (Google OR-Tools flagship metaheuristic)
+// - or_tools: OR-Tools-inspired heuristics (RelocateNeighbors, SpatialClusterLNS,
+//   RelocateSegment, ExchangeSegment, CrossExchange, PathCheapestArc)
 
 pub mod candidates;
+pub mod gls;
 pub mod heuristics;
+pub mod or_tools;
 pub mod soa;
 
 use crate::core::Solution;
