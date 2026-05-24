@@ -18,11 +18,13 @@ use accelerated_alg_discovery::domain::heuristics::{
     RuinRecreateHeuristic, SwapCitiesHeuristic, ThreeOptCandidate, TwoOptBestOfK,
     TwoOptLocalSearch,
 };
+use accelerated_alg_discovery::domain::kopt::KOptHeuristic;
 use accelerated_alg_discovery::domain::or_tools::{
     CrossExchangeHeuristic, ExchangeSegmentHeuristic, RelocateNeighborsHeuristic,
     RelocateSegmentHeuristic, SpatialClusterLNS, path_cheapest_arc_init,
 };
 use accelerated_alg_discovery::domain::soa::{soa_two_opt_full, DontLookBitmap, SoACoordinates, SoATour};
+use accelerated_alg_discovery::domain::tsplib::{known_optimal, TsplibInstance};
 use accelerated_alg_discovery::domain::{City, TspSolution};
 use accelerated_alg_discovery::infra::ring_buffer::{AdaptiveLadder, ExchangeNetwork, LockFreeRingBuffer, PathFragment};
 use rand::Rng;
@@ -508,20 +510,48 @@ fn main() {
         println!("  CrossExchange: PASS (valid={})", valid);
     }
 
-    // Test DQN agent
+    // Test DQN agent (with co-evolutionary state vector)
     {
         let mut agent = DqnAgent::with_config(14, make_dqn_config(14));
+        // New build_state with AST metadata and topology features
         let state = agent.build_state(100.0, 0.4, 500, 10000.0, 9000.0, 0.5,
-            &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05]);
+            &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05],
+            0.4,   // ast_depth: normalized depth of active AST
+            0.15,  // ast_volatility: normalized variance of AST outputs
+            2.5,   // bottleneck_ratio: max_degree / min_degree
+            0.3,   // graph_diameter_estimate: normalized BFS diameter
+        );
+        // Verify state dimensionality: 9 global features + 14 per-heuristic = 23
+        assert_eq!(state.len(), 23, "State dimension should be 9 + 14 = 23, got {}", state.len());
         let action = agent.select_action(&state);
         assert!(action < 14, "DQN action out of range: {}", action);
         for _ in 0..50 {
             let next_state = agent.build_state(99.0, 0.38, 510, 10000.0, 9000.0, 0.55,
-                &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05]);
+                &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05],
+                0.4, 0.15, 2.5, 0.3,
+            );
             agent.record_and_train(state.clone(), action, 1.0, next_state, false);
         }
         assert!(agent.epsilon < 0.3, "DQN epsilon should decay: {}", agent.epsilon);
-        println!("  DQN agent (14 actions): PASS (action={}, epsilon={:.3})", action, agent.epsilon);
+
+        // Test legacy build_state (backward compat)
+        let legacy_state = agent.build_state_legacy(100.0, 0.4, 500, 10000.0, 9000.0, 0.5,
+            &[0.1, -0.2, 0.3, 0.0, -0.1, 0.2, 0.0, 0.05, -0.15, 0.1, -0.1, 0.0, 0.2, -0.05]);
+        assert_eq!(legacy_state.len(), 23, "Legacy state dimension should also be 23");
+        // Legacy features at indices 5-8 should be zero
+        assert_eq!(legacy_state[5], 0.0, "Legacy ast_depth should be 0");
+        assert_eq!(legacy_state[6], 0.0, "Legacy ast_volatility should be 0");
+        assert_eq!(legacy_state[7], 0.0, "Legacy bottleneck_ratio should be 0");
+        assert_eq!(legacy_state[8], 0.0, "Legacy graph_diameter should be 0");
+
+        // Test compute_reward with AST fitness bonus
+        let reward_no_bonus = compute_reward(-5.0, true, 100, 1.0, None);
+        let reward_with_bonus = compute_reward(-5.0, true, 100, 1.0, Some(0.5));
+        let diff = reward_with_bonus - reward_no_bonus;
+        assert!((diff - 0.05).abs() < 0.001, "AST fitness bonus should add 0.05, got {}", diff);
+
+        println!("  DQN agent (14 actions, co-evolutionary): PASS (action={}, epsilon={:.3}, bonus_diff={:.3})",
+            action, agent.epsilon, diff);
     }
 
     // Test AST evaluation
@@ -630,6 +660,254 @@ fn main() {
             n, theoretical, pca_e, greedy_e, gap_2opt, gap,
             telemetry.gls_penalty_updates, status);
         if gap > 5.0 { failures += 1; }
+    }
+    println!();
+
+    // ── SECTION 9: AST Mutation Convergence on BERLIN52 ──
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!("SECTION 9: AST MUTATION CONVERGENCE ON BERLIN52 (50 generations, 9 operators)");
+    {
+        // 1. Load BERLIN52 from tsplib_data/BERLIN52.tsp
+        let instance = TsplibInstance::from_file("tsplib_data/BERLIN52.tsp")
+            .expect("Failed to load BERLIN52 — ensure tsplib_data/BERLIN52.tsp exists");
+        let n = instance.dimension;
+        println!("  Loaded {} ({} cities, {})", instance.name, n, instance.edge_weight_type);
+
+        // 2. Build the distance matrix and candidate set
+        let matrix = Arc::new(instance.matrix);
+        let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1)));
+
+        // Build initial solution: greedy NN → 2-opt
+        let mut sol = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 3);
+        let greedy_e = sol.evaluate_global();
+        let two_opt = TwoOptLocalSearch::full_search();
+        two_opt.apply(&mut sol);
+        let after_2opt = sol.evaluate_global();
+
+        // 3. Initialize AstPopulation with the 9 operators and context variables
+        let heuristics = make_heuristics_9();
+        let mut ast_pop = AstPopulation::new(20, 5);
+
+        // Record the initial best AST fitness
+        let initial_best_fitness = ast_pop.best().fitness;
+        let initial_avg_fitness = ast_pop.avg_fitness();
+        println!("  Initial AST pop | best_fitness={:.4} | avg_fitness={:.4}", initial_best_fitness, initial_avg_fitness);
+
+        // 4. Run 50 generations of AST mutation, using MCMC with GLS to evaluate each
+        let lambda = auto_lambda(&matrix, 0.2);
+        let num_generations = 50;
+        let iters_per_gen = 500; // short MCMC run per generation to evaluate AST quality
+        let mut best_ast_fitness_overall = initial_best_fitness;
+        let mut best_tour_energy = after_2opt;
+
+        let start = Instant::now();
+        for gen in 0..num_generations {
+            // Mutate the AST population
+            ast_pop.evolve();
+
+            // Evaluate the current best AST by running a short MCMC engine with GLS
+            let active_ast_idx = ast_pop.best_idx();
+            let reheat = ReheatConfig { stagnation_limit: 3000, reheat_fraction: 0.5, max_reheats: 1 };
+            let adaptive = AdaptiveCoolingConfig {
+                target_acceptance_rate: 0.4, window_size: 400,
+                cooling_rate_floor: 0.9990, cooling_rate_ceiling: 0.99995,
+                base_cooling_rate: 0.9997, adaptation_speed: 0.08,
+            };
+            let dqn_cfg = make_dqn_config(9);
+            let ast_cfg = AstConfig {
+                population_size: 20, max_depth: 5,
+                evolution_interval: iters_per_gen + 1, // don't evolve within the sub-run
+            };
+
+            let mut gls = GuidedLocalSearch::with_params(n, lambda, 200);
+            let engine = McmcEngine::with_neuro_memetic(
+                heuristics.clone(), 100.0, 0.9997, 1e-4,
+                reheat, adaptive, 2, dqn_cfg, ast_cfg,
+            );
+
+            // We pass the current AST population so the engine uses our evolved ASTs
+            let (best_sol, telemetry) = engine.optimize_with_penalty_escape(
+                sol.clone(), iters_per_gen, None, Some(ast_pop.clone()), &mut gls,
+            );
+
+            let tour_e = best_sol.evaluate_global();
+            if tour_e < best_tour_energy {
+                best_tour_energy = tour_e;
+                sol = best_sol;
+            }
+
+            // Track best AST fitness
+            let current_best_fitness = ast_pop.best().fitness;
+            if current_best_fitness > best_ast_fitness_overall {
+                best_ast_fitness_overall = current_best_fitness;
+            }
+
+            // Record outcomes back into the AST population based on engine results
+            ast_pop.record_outcome(active_ast_idx, -(tour_e - after_2opt), tour_e < after_2opt);
+
+            if gen % 10 == 0 || gen == num_generations - 1 {
+                println!("  gen {:>3}/{:>3} | best_ast_fit={:.4} | avg_ast_fit={:.4} | tour={:.1} | best_tour={:.1} | diversity={:.2}",
+                    gen + 1, num_generations,
+                    ast_pop.best().fitness, ast_pop.avg_fitness(),
+                    tour_e, best_tour_energy, ast_pop.diversity());
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // 5. Track the best AST fitness and print progress
+        let final_best_fitness = ast_pop.best().fitness;
+        let final_avg_fitness = ast_pop.avg_fitness();
+        let fitness_improved = final_best_fitness > initial_best_fitness || best_tour_energy < after_2opt;
+
+        println!("  AST convergence | init_best={:.4} → final_best={:.4} | init_avg={:.4} → final_avg={:.4}",
+            initial_best_fitness, final_best_fitness, initial_avg_fitness, final_avg_fitness);
+        println!("  Tour energy     | greedy={:.1} | 2opt={:.1} | AST_best={:.1} | improvement={:.1}%",
+            greedy_e, after_2opt, best_tour_energy,
+            (after_2opt - best_tour_energy) / after_2opt * 100.0);
+        println!("  AST best fitness improved: {} | {}ms", fitness_improved, elapsed.as_millis());
+
+        // Compare against known optimal
+        if let Some(optimal) = known_optimal("BERLIN52") {
+            let gap = (best_tour_energy - optimal) / optimal * 100.0;
+            println!("  BERLIN52 optimal={:.0} | gap={:.2}%", optimal, gap);
+        }
+
+        // 6. Assert that the mutation framework successfully optimized the selection criteria
+        assert!(fitness_improved,
+            "AST mutation framework should show improvement: best_fitness went from {:.4} to {:.4}, tour from {:.1} to {:.1}",
+            initial_best_fitness, final_best_fitness, after_2opt, best_tour_energy);
+        println!("  AST MUTATION CONVERGENCE: PASS");
+    }
+    println!();
+
+    // ── SECTION 10: TSPLIB REAL BENCHMARKS ──
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!("SECTION 10: TSPLIB REAL BENCHMARKS (EIL51, BERLIN52, KROA100 — full pipeline)");
+    {
+        let benchmark_instances: Vec<(&str, &str)> = vec![
+            ("EIL51", "tsplib_data/EIL51.tsp"),
+            ("BERLIN52", "tsplib_data/BERLIN52.tsp"),
+            ("KROA100", "tsplib_data/KROA100.tsp"),
+        ];
+
+        for (inst_name, tsp_path) in &benchmark_instances {
+            println!("\n  ── {} ──", inst_name);
+
+            // 1. Load from TSPLIB file
+            let instance = match TsplibInstance::from_file(tsp_path) {
+                Ok(inst) => inst,
+                Err(e) => {
+                    println!("    SKIP: could not load {} from {}: {}", inst_name, tsp_path, e);
+                    continue;
+                }
+            };
+            let n = instance.dimension;
+            println!("    Loaded: {} cities, edge_weight_type={}", n, instance.edge_weight_type);
+
+            // Build distance matrix and candidate set from the parsed instance
+            let matrix = Arc::new(instance.matrix);
+            let candidates = Arc::new(CandidateSet::build(&matrix, 20.min(n - 1)));
+
+            // 2. Run full pipeline: greedy init → 2-opt → MCMC with GLS + DQN + AST
+            // Phase 1: Greedy NN initialization (multiple starts)
+            let mut best_init = build_greedy_nn(n, Arc::clone(&matrix), Arc::clone(&candidates), 5);
+            let mut best_init_e = best_init.evaluate_global();
+
+            // Also try path cheapest arc
+            let pca_route = path_cheapest_arc_init(&matrix, &candidates);
+            let pca_sol = TspSolution::new(pca_route, Arc::clone(&matrix), Arc::clone(&candidates));
+            let pca_e = pca_sol.evaluate_global();
+            if pca_e < best_init_e {
+                best_init = pca_sol;
+                best_init_e = pca_e;
+            }
+            println!("    Init: GreedyNN/PCA best={:.1}", best_init_e);
+
+            // Phase 2: 2-opt local search
+            let two_opt = TwoOptLocalSearch::full_search();
+            two_opt.apply(&mut best_init);
+            let after_2opt = best_init.evaluate_global();
+            println!("    After 2-opt: {:.1} ({:.1}% improvement from init)",
+                after_2opt, (best_init_e - after_2opt) / best_init_e * 100.0);
+
+            // Phase 3: Full MCMC engine with GLS + DQN + AST (14 heuristics + KOptHeuristic)
+            let heuristics: Vec<Arc<dyn LowLevelHeuristic<TspSolution>>> = vec![
+                Arc::new(TwoOptLocalSearch::single_pass()),
+                Arc::new(LinKernighanHeuristic { kick_rounds: 3 }),
+                Arc::new(ThreeOptCandidate { samples: 10 }),
+                Arc::new(KOptHeuristic::default_k5()),
+                Arc::new(SpatialClusterLNS::new(15)),
+                Arc::new(RelocateNeighborsHeuristic::new(5)),
+                Arc::new(RelocateSegmentHeuristic::new(3)),
+                Arc::new(ExchangeSegmentHeuristic::new(3)),
+                Arc::new(CrossExchangeHeuristic),
+                Arc::new(DoubleBridgeHeuristic),
+                Arc::new(RuinRecreateHeuristic { ruin_fraction: 0.15 }),
+                Arc::new(OrOptHeuristic { max_segment_len: 3 }),
+                Arc::new(TwoOptBestOfK { k: 15 }),
+                Arc::new(InvertSegmentHeuristic),
+            ];
+
+            let reheat = ReheatConfig { stagnation_limit: 3000, reheat_fraction: 0.5, max_reheats: 3 };
+            let adaptive = AdaptiveCoolingConfig {
+                target_acceptance_rate: 0.4, window_size: 400,
+                cooling_rate_floor: 0.9990, cooling_rate_ceiling: 0.99995,
+                base_cooling_rate: 0.9997, adaptation_speed: 0.08,
+            };
+            let dqn_cfg = DqnConfig {
+                learning_rate: 0.001,
+                discount: 0.95,
+                epsilon_start: 0.3,
+                epsilon_end: 0.05,
+                epsilon_decay: 0.9997,
+                replay_capacity: 1000,
+                batch_size: 32,
+                target_update_freq: 200,
+            };
+            let ast_cfg = AstConfig { population_size: 20, max_depth: 5, evolution_interval: 2000 };
+
+            let lambda = auto_lambda(&matrix, 0.2);
+            let mut gls = GuidedLocalSearch::with_params(n, lambda, 300);
+            let iters = (n * 400).max(30_000);
+
+            let start = Instant::now();
+            let engine = McmcEngine::with_neuro_memetic(
+                heuristics, 200.0, 0.9997, 1e-4, reheat, adaptive, 2, dqn_cfg, ast_cfg,
+            );
+            let (best_sol, telemetry) = engine.optimize_with_penalty_escape(
+                best_init, iters, None, None, &mut gls,
+            );
+            let elapsed = start.elapsed();
+
+            let final_e = best_sol.evaluate_global();
+
+            // 3. Compare against known optimal
+            let optimal = known_optimal(inst_name);
+            let gap_pct = optimal.map(|opt| (final_e - opt) / opt * 100.0);
+
+            // 4. Report gap percentage
+            let vs_greedy = (best_init_e - final_e) / best_init_e * 100.0;
+            let vs_2opt = (after_2opt - final_e) / after_2opt * 100.0;
+            match (optimal, gap_pct) {
+                (Some(opt), Some(gap)) => {
+                    let status = if gap <= 1.0 { "NEAR_OPTIMAL" } else if gap <= 3.0 { "EXCELLENT" } else if gap <= 8.0 { "GOOD" } else { "SUBOPTIMAL" };
+                    println!("    Final: {:.1} | vsGreedy={:+.1}% | vs2opt={:+.1}% | optimal={:.0} | gap={:.2}% | {} | GLS_pen={} | {}ms",
+                        final_e, vs_greedy, vs_2opt, opt, gap, status,
+                        telemetry.gls_penalty_updates, elapsed.as_millis());
+                    if gap > 15.0 { failures += 1; }
+                }
+                _ => {
+                    println!("    Final: {:.1} | vsGreedy={:+.1}% | vs2opt={:+.1}% | optimal=N/A | GLS_pen={} | {}ms",
+                        final_e, vs_greedy, vs_2opt,
+                        telemetry.gls_penalty_updates, elapsed.as_millis());
+                }
+            }
+
+            // Validate solution integrity
+            assert!(best_sol.validate().is_ok(), "Final solution for {} should be valid", inst_name);
+
+            results.push((inst_name, best_init_e, after_2opt, final_e));
+        }
     }
     println!();
 

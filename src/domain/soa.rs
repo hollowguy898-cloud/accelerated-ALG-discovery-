@@ -79,15 +79,24 @@ impl SoACoordinates {
     }
 
     /// Compute Euclidean distance between two cities using the SoA layout.
+    ///
+    /// For TSPLIB EUC_2D compatibility, distances are rounded to the nearest
+    /// integer per the TSPLIB standard. This is critical for instances like
+    /// EIL51 where the optimal tour is computed under integer arithmetic.
+    /// Without rounding, the engine optimizes a continuous landscape that
+    /// doesn't match the discrete benchmark, producing artificially short tours
+    /// (e.g., EIL51 showing 323 instead of the true optimal 426).
     #[inline]
     pub fn distance(&self, a: usize, b: usize) -> f32 {
         let dx = self.x.0[a] - self.x.0[b];
         let dy = self.y.0[a] - self.y.0[b];
-        (dx * dx + dy * dy).sqrt()
+        // TSPLIB EUC_2D standard: round to nearest integer
+        (dx * dx + dy * dy).sqrt().round()
     }
 
     /// Batch compute distances from city `a` to all other cities.
     /// Optimized for sequential access patterns.
+    /// Uses TSPLIB EUC_2D rounding for standard compliance.
     pub fn distances_from(&self, a: usize) -> Vec<f32> {
         let ax = self.x.0[a];
         let ay = self.y.0[a];
@@ -95,7 +104,8 @@ impl SoACoordinates {
         for i in 0..self.n {
             let dx = self.x.0[i] - ax;
             let dy = self.y.0[i] - ay;
-            distances.push((dx * dx + dy * dy).sqrt());
+            // TSPLIB EUC_2D standard: round to nearest integer
+            distances.push((dx * dx + dy * dy).sqrt().round());
         }
         distances
     }

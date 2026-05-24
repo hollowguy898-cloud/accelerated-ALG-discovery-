@@ -425,6 +425,9 @@ fn main() {
             max_iterations_per_round: 50,
             optimality_gap_threshold: 0.0001,
             use_secs: true,
+            stall_rounds_threshold: 5,
+            elite_frequency_threshold: 0.95,
+            max_forced_edges: 10,
         },
     );
     lb_state.set_upper_bound(post_2opt_energy);

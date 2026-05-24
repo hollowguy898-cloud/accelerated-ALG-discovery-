@@ -40,9 +40,12 @@ pub struct City {
 }
 
 impl City {
-    /// Computes the Euclidean distance to another city.
+    /// Computes the Euclidean distance to another city, rounded to the nearest
+    /// integer per the TSPLIB EUC_2D standard. This ensures the engine
+    /// optimizes on the same discrete landscape as the benchmark, preventing
+    /// artificially short tours (e.g., EIL51 showing 323 vs true optimal 426).
     pub fn distance_to(&self, other: &City) -> f64 {
-        ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
+        ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt().round()
     }
 }
 

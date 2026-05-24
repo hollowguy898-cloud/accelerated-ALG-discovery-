@@ -353,6 +353,9 @@ fn solve_instance(instance: &TsplibInstance, max_iterations: usize, num_threads:
             max_iterations_per_round: if n < 200 { 100 } else { 30 },
             optimality_gap_threshold: 0.0001,
             use_secs: true,
+            stall_rounds_threshold: 5,
+            elite_frequency_threshold: 0.95,
+            max_forced_edges: 10,
         },
     );
     lb_state.set_upper_bound(post_2opt_energy);

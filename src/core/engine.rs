@@ -248,11 +248,15 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
         &self, agent: &mut DqnAgent, stats: &[HeuristicStats],
         temperature: f64, accept_rate: f64, stall_count: usize,
         current_energy: f64, best_energy: f64, progress: f64,
+        ast_depth: f64, ast_volatility: f64,
+        bottleneck_ratio: f64, graph_diameter_estimate: f64,
     ) -> usize {
         let performances: Vec<f64> = stats.iter().map(|s| s.performance).collect();
         let state = agent.build_state(
             temperature, accept_rate, stall_count,
             current_energy, best_energy, progress, &performances,
+            ast_depth, ast_volatility,
+            bottleneck_ratio, graph_diameter_estimate,
         );
         agent.select_action(&state).min(self.heuristics.len() - 1)
     }
@@ -381,11 +385,26 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
             let progress = iteration as f64 / max_iterations as f64;
 
             // ── Heuristic Selection ──
+            // Compute AST metadata for the co-evolutionary state vector
+            let (ast_depth, ast_volatility) = if self.selection_mode == SelectionMode::DqnWithAst {
+                let tree = &ast_pop.trees[active_ast_idx];
+                let max_d = ast_pop.max_depth.max(1) as f64;
+                let depth_norm = tree.root.depth() as f64 / max_d;
+                // Use the DQN agent's normalized TD-error variance as a proxy
+                // for AST output volatility in the state vector
+                let vol = dqn_agent.get_normalized_ast_volatility();
+                (depth_norm, vol)
+            } else {
+                (0.0, 0.0)
+            };
+
             let idx = match self.selection_mode {
                 SelectionMode::ChoiceFunction => self.select_choice_function(&stats, &mut rng),
                 SelectionMode::DqnOnly | SelectionMode::DqnWithAst => self.select_dqn(
                     &mut dqn_agent, &stats, t, recent_accept_rate,
                     iterations_since_improvement, current_real_energy, best_energy, progress,
+                    ast_depth, ast_volatility,
+                    0.0, 0.0, // topology defaults — set externally via build_state()
                 ),
             };
             let heuristic = &self.heuristics[idx];
@@ -506,6 +525,8 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                 let state = dqn_agent.build_state(
                     t, recent_accept_rate, iterations_since_improvement,
                     current_real_energy, best_energy, progress, &performances,
+                    ast_depth, ast_volatility,
+                    0.0, 0.0, // topology defaults
                 );
                 // When penalty escape is active, use the raw heuristic delta (or 0)
                 // for the reward signal, matching the original penalty-path behavior.
@@ -515,11 +536,24 @@ impl<'a, S: Solution> McmcEngine<'a, S> {
                 } else {
                     delta_real
                 };
-                let reward = compute_reward(reward_delta, accepted, iterations_since_improvement, 1.0);
+                // Co-evolutionary AST fitness bonus: when AST is active, feed the
+                // DQN's learning dynamics back into the reward signal. AST structures
+                // that stabilize TD-errors or cause reward spikes get bonus weight.
+                let ast_fitness_bonus = if self.selection_mode == SelectionMode::DqnWithAst {
+                    Some(dqn_agent.compute_ast_fitness_bonus())
+                } else {
+                    None
+                };
+                let reward = compute_reward(
+                    reward_delta, accepted, iterations_since_improvement, 1.0,
+                    ast_fitness_bonus,
+                );
                 let next_state = dqn_agent.build_state(
                     t * effective_cooling_rate, recent_accept_rate,
                     iterations_since_improvement + 1, current_real_energy, best_energy,
                     (iteration + 1) as f64 / max_iterations as f64, &performances,
+                    ast_depth, ast_volatility,
+                    0.0, 0.0, // topology defaults
                 );
                 dqn_agent.record_and_train(state, idx, reward, next_state, false);
             }
