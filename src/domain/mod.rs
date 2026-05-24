@@ -18,10 +18,13 @@
 // - two_opt_delta() for O(1) 2-opt move delta computation
 // - recompute_energy() for forced cache refresh
 
+pub mod alpha_nearness;
 pub mod candidates;
 pub mod gls;
 pub mod heuristics;
+pub mod kopt;
 pub mod or_tools;
+pub mod simd_delta;
 pub mod soa;
 
 use crate::core::Solution;

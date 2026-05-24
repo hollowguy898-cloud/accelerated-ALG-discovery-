@@ -9,7 +9,10 @@
 
 pub mod engine;
 pub mod hyper_ast;
+pub mod lower_bound;
+pub mod nn_macro;
 pub mod rl;
+pub mod speculative;
 
 /// A solution representation that can be evaluated for its energy (cost).
 ///

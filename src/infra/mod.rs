@@ -5,6 +5,7 @@
 // - ring_buffer: Lock-free ring buffer for asymmetric elite injection
 // - Adaptive temperature ladder integrated into ring_buffer module
 
+pub mod dedup;
 pub mod ring_buffer;
 
 use std::collections::HashMap;
