@@ -26,6 +26,7 @@ pub mod kopt;
 pub mod or_tools;
 pub mod simd_delta;
 pub mod soa;
+pub mod tsplib;
 
 use crate::core::Solution;
 use candidates::CandidateSet;

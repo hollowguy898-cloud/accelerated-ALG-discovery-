@@ -37,20 +37,33 @@ use rand::Rng;
 /// | 5       | 2-opt on edges 2-3   | S1, S2', S3                    |
 ///
 /// Segment definitions (relative to the break points):
-/// - S1 = route[p0+1 ..= p1]   (between break 0 and break 1)
-/// - S2 = route[p1+1 ..= p2]   (between break 1 and break 2)
-/// - S3 = route[p2+1 ..] ++ route[..= p0]  (wrap-around tail + head)
+/// - S1 = route[p0+1 .. p1]   (between break 0 and break 1, exclusive of anchors)
+/// - S2 = route[p1+1 .. p2]   (between break 1 and break 2, exclusive of anchors)
+/// - S3 = route[p2+1 ..] ++ route[.. p0]  (wrap-around tail + head, exclusive of anchors)
 ///
 /// The anchor cities c0 = route[p0], c1 = route[p1], c2 = route[p2] are
-/// preserved at their respective junctions in every pattern.
+/// placed explicitly in each reconnection pattern. The segments do NOT
+/// include the anchor cities to avoid duplication.
 fn apply_3opt_reconnection(solution: &mut TspSolution, p0: usize, p1: usize, p2: usize, pattern: usize) {
+    let n = solution.route.len();
+    // Segments are defined EXCLUSIVE of anchor cities (c0, c1, c2).
+    // The anchors are placed explicitly in the reconnection to avoid duplication.
+    //
+    // S1 = cities strictly between c0 and c1:  route[p0+1 .. p1]
+    // S2 = cities strictly between c1 and c2:  route[p1+1 .. p2]
+    // S3 = cities after c2 and before c0:      route[p2+1..] ++ route[..p0]
     let c0 = solution.route[p0];
     let c1 = solution.route[p1];
     let c2 = solution.route[p2];
-    let s1 = solution.route[p0 + 1..=p1].to_vec();
-    let s2 = solution.route[p1 + 1..=p2].to_vec();
+    let s1 = solution.route[p0 + 1..p1].to_vec();
+    let s2 = solution.route[p1 + 1..p2].to_vec();
     let mut s3 = solution.route[p2 + 1..].to_vec();
-    s3.extend_from_slice(&solution.route[..=p0]);
+    s3.extend_from_slice(&solution.route[..p0]);
+
+    // Sanity: the 3 anchors + 3 segments must reconstruct the full tour
+    debug_assert_eq!(1 + s1.len() + 1 + s2.len() + 1 + s3.len(), n,
+        "3-opt segment sizes don't sum to n: 1+{}+1+{}+1+{} = {} vs n={}",
+        s1.len(), s2.len(), s3.len(), 1 + s1.len() + 1 + s2.len() + 1 + s3.len(), n);
 
     match pattern {
         0 => {
@@ -121,6 +134,7 @@ fn apply_3opt_reconnection(solution: &mut TspSolution, p0: usize, p1: usize, p2:
         }
         _ => {}
     }
+    solution.invalidate_energy();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
